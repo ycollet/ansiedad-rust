@@ -1,0 +1,12 @@
+[package]
+name = "ansiedad"
+version = "0.1.0"
+edition = "2024"
+description = "Live-coded ANSI bytebeat visuals in your terminal"
+license = "AGPL-3.0-only"
+
+[dependencies]
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+unicode-width = "0.2"
