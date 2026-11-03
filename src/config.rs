@@ -4,7 +4,7 @@ use std::{fs, path::Path};
 
 pub const STARTER: &str = "\
 # Type below for live preview; no file is required.
-# Tab: focus | Ctrl-S: save to editme.toml | Ctrl-Q: quit
+# Tab: focus | Ctrl-S: save to editme.txt | Ctrl-Q: quit
 # Ctrl-P: pause | Ctrl-R: reset | F5: reload a saved file
 # t advances per character; b/f are colors, c is a glyph.
 b = \"t >> 4\"

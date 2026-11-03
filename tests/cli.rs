@@ -64,31 +64,31 @@ fn file_free_startup_and_explicit_config_errors() {
     let output = run(&["--check"]);
     assert!(output.status.success(), "{:?}", output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("built-in example"));
-    assert!(!directory.join("editme.toml").exists());
+    assert!(!directory.join("editme.txt").exists());
     let output = run(&["--check", "missing.toml"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("missing.toml"));
 
-    fs::write(directory.join("editme.toml"), "invalid TOML").unwrap();
+    fs::write(directory.join("editme.txt"), "invalid TOML").unwrap();
     assert!(
         run(&["--check"]).status.success(),
         "implicit files must not affect scratch mode"
     );
-    assert!(!run(&["--check", "editme.toml"]).status.success());
+    assert!(!run(&["--check", "editme.txt"]).status.success());
     assert!(
         !run(&["--init"]).status.success(),
         "--init must not overwrite"
     );
-    fs::remove_file(directory.join("editme.toml")).unwrap();
+    fs::remove_file(directory.join("editme.txt")).unwrap();
     assert!(run(&["--init"]).status.success());
-    let starter = fs::read_to_string(directory.join("editme.toml")).unwrap();
+    let starter = fs::read_to_string(directory.join("editme.txt")).unwrap();
     assert!(starter.contains("Ctrl-S") && starter.contains("b = \"t >> 4\""));
-    assert!(run(&["--check", "editme.toml"]).status.success());
+    assert!(run(&["--check", "editme.txt"]).status.success());
     for name in ["editme", "patch.txt"] {
         assert!(run(&["--init", name]).status.success());
         assert!(run(&["--check", name]).status.success());
         fs::remove_file(directory.join(name)).unwrap();
     }
-    fs::remove_file(directory.join("editme.toml")).unwrap();
+    fs::remove_file(directory.join("editme.txt")).unwrap();
     fs::remove_dir(directory).unwrap();
 }

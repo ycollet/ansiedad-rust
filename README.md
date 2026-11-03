@@ -51,10 +51,10 @@ with `--size`, for example `ansiedad --size 120x40 --maximize`.
 No configuration file is required, even when running the installed executable
 outside this repository. By default, the editor starts with built-in shortcut
 comments and a simple expression. No files are read or created automatically.
-Ctrl-S creates `editme.toml` in the current directory; an existing file is never
+Ctrl-S creates `editme.txt` in the current directory; an existing file is never
 overwritten by a scratch buffer. To open an existing file, pass its path explicitly.
 The filename extension is optional: `ansiedad editme` and `ansiedad patch.txt`
-work just like `ansiedad editme.toml`. These are plain text files; their contents
+work just like `ansiedad editme.txt`. These are plain text files; their contents
 must use TOML syntax, regardless of the filename.
 
 The upper half renders visuals; the lower half is an interactive TOML editor,
@@ -67,7 +67,7 @@ advance time so a temporary division by zero does not permanently stall playback
 | Key | Action |
 | --- | --- |
 | Tab | Switch focus between the editor and visuals |
-| Ctrl-S | Save to the loaded file, or create `editme.toml` from a scratch buffer |
+| Ctrl-S | Save to the loaded file, or create `editme.txt` from a scratch buffer |
 | Ctrl-P / Ctrl-R | Pause/resume / reset time from either pane |
 | Ctrl-Q / Ctrl-C | Quit; repeat to discard an unsaved draft |
 | F5 | Reload a loaded/saved file; repeat to discard an unsaved draft |
@@ -88,7 +88,7 @@ Your terminal's palette controls the appearance of ANSI colors 0 through 15.
 
 ```sh
 cargo run --release -- my-patch.toml
-cargo run -- --init                # optional: create editme.toml
+cargo run -- --init                # optional: create editme.txt
 cargo run -- --init my-patch.toml  # create an example; never overwrite
 cargo run -- --check my-patch.toml
 cargo install --path .

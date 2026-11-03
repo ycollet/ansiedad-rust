@@ -33,9 +33,9 @@ ANSIedad - live-coded ANSI bytebeat visuals
 Usage: ansiedad [OPTIONS] [CONFIG]
 
 Without CONFIG, start with a built-in example; no file is needed.
-Ctrl-S creates editme.toml. Pass CONFIG explicitly to load an existing file.
+Ctrl-S creates editme.txt. Pass CONFIG explicitly to load an existing file.
 
-  --init           Write an example CONFIG (default: editme.toml; never overwrite)
+  --init           Write an example CONFIG (default: editme.txt; never overwrite)
   --check          Validate CONFIG or the built-in example without a terminal
   --frames N       Exit after N frames (useful for recording/smoke tests)
   --size COLSxROWS Request a terminal size at startup (e.g. 120x40)
@@ -419,7 +419,7 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                     let reloading = key.code == KeyCode::F(5);
                     if reloading && args.path.is_none() {
                         confirm = None;
-                        notice = Some("No file loaded; Ctrl-S creates editme.toml".into());
+                        notice = Some("No file loaded; Ctrl-S creates editme.txt".into());
                         continue;
                     }
                     let action = if quitting {
@@ -465,7 +465,7 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                         KeyCode::Tab | KeyCode::BackTab => editing = !editing,
                         KeyCode::Esc if editing => editing = false,
                         KeyCode::Char('s') if control => {
-                            let path = args.path.clone().unwrap_or_else(|| "editme.toml".into());
+                            let path = args.path.clone().unwrap_or_else(|| "editme.txt".into());
                             notice = Some(match editor.save(&path) {
                                 Ok(()) => {
                                     live.reload(&path);
@@ -537,7 +537,7 @@ fn start() -> Result<(), Box<dyn Error>> {
         let path = args
             .path
             .as_deref()
-            .unwrap_or_else(|| Path::new("editme.toml"));
+            .unwrap_or_else(|| Path::new("editme.txt"));
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
         file.write_all(config::STARTER.as_bytes())?;
         println!("Created {}", path.display());
