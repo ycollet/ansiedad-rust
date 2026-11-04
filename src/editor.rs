@@ -3,7 +3,7 @@ use crossterm::{
     cursor::{MoveTo, Show},
     event::{KeyCode, KeyEvent, KeyModifiers},
     queue,
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{Clear, ClearType},
 };
 use std::{
@@ -13,12 +13,19 @@ use std::{
 };
 use unicode_width::UnicodeWidthChar;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Position {
+    row: usize,
+    col: usize,
+}
+
 pub struct Editor {
     lines: Vec<String>,
     row: usize,
     col: usize,
     top: usize,
     left: usize,
+    anchor: Option<Position>,
     saved: String,
     on_disk: bool,
     pub error: Option<String>,
@@ -32,6 +39,7 @@ impl Editor {
             col: 0,
             top: 0,
             left: 0,
+            anchor: None,
             saved: source.into(),
             on_disk: true,
             error: None,
@@ -57,10 +65,65 @@ impl Editor {
     }
 
     fn byte(&self) -> usize {
-        self.lines[self.row]
+        self.byte_at(self.cursor())
+    }
+
+    fn cursor(&self) -> Position {
+        Position {
+            row: self.row,
+            col: self.col,
+        }
+    }
+
+    fn byte_at(&self, position: Position) -> usize {
+        self.lines[position.row]
             .char_indices()
-            .nth(self.col)
-            .map_or(self.lines[self.row].len(), |(byte, _)| byte)
+            .nth(position.col)
+            .map_or(self.lines[position.row].len(), |(byte, _)| byte)
+    }
+
+    fn selection(&self) -> Option<(Position, Position)> {
+        let anchor = self.anchor?;
+        let cursor = self.cursor();
+        (anchor != cursor).then_some((anchor.min(cursor), anchor.max(cursor)))
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        Some(
+            (start.row..=end.row)
+                .map(|row| {
+                    let left = if row == start.row {
+                        self.byte_at(start)
+                    } else {
+                        0
+                    };
+                    let right = if row == end.row {
+                        self.byte_at(end)
+                    } else {
+                        self.lines[row].len()
+                    };
+                    &self.lines[row][left..right]
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    pub fn delete_selection(&mut self) -> bool {
+        let selection = self.selection();
+        self.anchor = None;
+        let Some((start, end)) = selection else {
+            return false;
+        };
+        let tail = self.lines[end.row][self.byte_at(end)..].to_string();
+        let byte = self.byte_at(start);
+        self.lines[start.row].truncate(byte);
+        self.lines[start.row].push_str(&tail);
+        self.lines.drain(start.row + 1..end.row + 1);
+        self.row = start.row;
+        self.col = start.col;
+        true
     }
 
     fn clamp_col(&mut self) {
@@ -76,6 +139,10 @@ impl Editor {
             .chars()
             .filter(|c| *c == '\n' || !c.is_control())
             .collect();
+        if text.is_empty() {
+            return;
+        }
+        self.delete_selection();
         let byte = self.byte();
         let tail = self.lines[self.row].split_off(byte);
         let mut parts = text.split('\n');
@@ -91,24 +158,47 @@ impl Editor {
     }
 
     pub fn input(&mut self, key: KeyEvent, page: usize) -> bool {
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            if key.modifiers == KeyModifiers::CONTROL {
-                match key.code {
-                    KeyCode::Home => {
-                        self.row = 0;
-                        self.col = 0;
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('m') {
+            return self.toggle_comments();
+        }
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let navigation = matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+        );
+        if control && !navigation {
+            return false;
+        }
+        if navigation {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                let cursor = self.cursor();
+                self.anchor.get_or_insert(cursor);
+            } else {
+                let selection = self.selection();
+                self.anchor = None;
+                if let Some((start, end)) = selection {
+                    let collapse = match key.code {
+                        KeyCode::Left => Some(start),
+                        KeyCode::Right => Some(end),
+                        _ => None,
+                    };
+                    if let Some(position) = collapse {
+                        self.row = position.row;
+                        self.col = position.col;
+                        return false;
                     }
-                    KeyCode::End => {
-                        self.row = self.lines.len() - 1;
-                        self.col = self.lines[self.row].chars().count();
-                    }
-                    _ => {}
                 }
             }
-            return false;
         }
         match key.code {
             KeyCode::Char(c) if !c.is_control() => {
@@ -120,6 +210,9 @@ impl Editor {
                 return true;
             }
             KeyCode::Backspace => {
+                if self.delete_selection() {
+                    return true;
+                }
                 if self.col > 0 {
                     let end = self.byte();
                     self.col -= 1;
@@ -135,6 +228,9 @@ impl Editor {
                 }
             }
             KeyCode::Delete => {
+                if self.delete_selection() {
+                    return true;
+                }
                 let byte = self.byte();
                 if byte < self.lines[self.row].len() {
                     let length = self.lines[self.row][byte..]
@@ -150,22 +246,12 @@ impl Editor {
                     return true;
                 }
             }
-            KeyCode::Left => {
-                if self.col > 0 {
-                    self.col -= 1;
-                } else if self.row > 0 {
-                    self.row -= 1;
-                    self.col = self.lines[self.row].chars().count();
-                }
-            }
-            KeyCode::Right => {
-                if self.col < self.lines[self.row].chars().count() {
-                    self.col += 1;
-                } else if self.row + 1 < self.lines.len() {
-                    self.row += 1;
-                    self.col = 0;
-                }
-            }
+            KeyCode::Left if control => self.word_left(),
+            KeyCode::Right if control => self.word_right(),
+            KeyCode::Up if control => self.paragraph_up(),
+            KeyCode::Down if control => self.paragraph_down(),
+            KeyCode::Left => self.move_left(),
+            KeyCode::Right => self.move_right(),
             KeyCode::Up => {
                 self.row = self.row.saturating_sub(1);
                 self.clamp_col();
@@ -182,11 +268,147 @@ impl Editor {
                 self.row = (self.row + page.max(1)).min(self.lines.len() - 1);
                 self.clamp_col();
             }
-            KeyCode::Home => self.col = 0,
-            KeyCode::End => self.col = self.lines[self.row].chars().count(),
+            KeyCode::Home => {
+                if control {
+                    self.row = 0;
+                }
+                self.col = 0;
+            }
+            KeyCode::End => {
+                if control {
+                    self.row = self.lines.len() - 1;
+                }
+                self.col = self.lines[self.row].chars().count();
+            }
             _ => {}
         }
         false
+    }
+
+    fn move_left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.col < self.lines[self.row].chars().count() {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    fn previous_char(&self) -> Option<char> {
+        if self.col == 0 {
+            (self.row > 0).then_some('\n')
+        } else {
+            self.lines[self.row].chars().nth(self.col - 1)
+        }
+    }
+
+    fn next_char(&self) -> Option<char> {
+        self.lines[self.row]
+            .chars()
+            .nth(self.col)
+            .or_else(|| (self.row + 1 < self.lines.len()).then_some('\n'))
+    }
+
+    fn word_left(&mut self) {
+        while self.previous_char().is_some_and(char::is_whitespace) {
+            self.move_left();
+        }
+        let class = self.previous_char().map(word_class);
+        while class.is_some() && self.previous_char().map(word_class) == class {
+            self.move_left();
+        }
+    }
+
+    fn word_right(&mut self) {
+        let class = self.next_char().map(word_class);
+        while class.is_some() && self.next_char().map(word_class) == class {
+            self.move_right();
+        }
+        while self.next_char().is_some_and(char::is_whitespace) {
+            self.move_right();
+        }
+    }
+
+    fn paragraph_up(&mut self) {
+        if self.col == 0 {
+            self.row = self.row.saturating_sub(1);
+        }
+        while self.row > 0 && self.lines[self.row].trim().is_empty() {
+            self.row -= 1;
+        }
+        while self.row > 0 && !self.lines[self.row - 1].trim().is_empty() {
+            self.row -= 1;
+        }
+        self.col = 0;
+    }
+
+    fn paragraph_down(&mut self) {
+        while self.row < self.lines.len() && !self.lines[self.row].trim().is_empty() {
+            self.row += 1;
+        }
+        while self.row < self.lines.len() && self.lines[self.row].trim().is_empty() {
+            self.row += 1;
+        }
+        if self.row == self.lines.len() {
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+        } else {
+            self.col = 0;
+        }
+    }
+
+    fn toggle_comments(&mut self) -> bool {
+        let (first, last) = match self.selection() {
+            Some((start, end)) => (start.row, end.row - usize::from(end.col == 0)),
+            None => (self.row, self.row),
+        };
+        let uncomment = self.lines[first..=last]
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| line.trim_start().starts_with('#'));
+        let mut changed = false;
+        for row in first..=last {
+            let line = &mut self.lines[row];
+            let byte = line.len() - line.trim_start().len();
+            if byte == line.len() {
+                continue;
+            }
+            let indent = line[..byte].chars().count();
+            let removed = if uncomment {
+                let count = if line[byte..].starts_with("# ") { 2 } else { 1 };
+                line.replace_range(byte..byte + count, "");
+                count
+            } else {
+                line.insert_str(byte, "# ");
+                0
+            };
+            let adjust = |position: &mut Position| {
+                if position.row == row && position.col > indent {
+                    position.col = if uncomment {
+                        indent + (position.col - indent).saturating_sub(removed)
+                    } else {
+                        position.col + 2
+                    };
+                }
+            };
+            let mut cursor = self.cursor();
+            adjust(&mut cursor);
+            self.col = cursor.col;
+            if let Some(anchor) = &mut self.anchor {
+                adjust(anchor);
+            }
+            changed = true;
+        }
+        changed
     }
 
     pub fn preview(&mut self) -> Option<Config> {
@@ -282,7 +504,52 @@ impl Editor {
                         ResetColor
                     )?;
                 }
-                queue!(out, Print(window(text, self.left, available)))?;
+                if let Some((start, end)) = self.selection()
+                    && (start.row..=end.row).contains(&index)
+                {
+                    let mut column = 0;
+                    let mut highlighted = false;
+                    for (col, character) in text.chars().chain(std::iter::once(' ')).enumerate() {
+                        let size = char_width(character);
+                        let right = column + size;
+                        if column >= self.left + available {
+                            break;
+                        }
+                        if right > self.left {
+                            let position = Position { row: index, col };
+                            let selected = start <= position && position < end;
+                            if selected != highlighted {
+                                if selected {
+                                    queue!(
+                                        out,
+                                        SetBackgroundColor(Color::DarkBlue),
+                                        SetForegroundColor(Color::White)
+                                    )?;
+                                } else {
+                                    queue!(out, ResetColor)?;
+                                }
+                                highlighted = selected;
+                            }
+                            if character.is_control()
+                                || column < self.left
+                                || right > self.left + available
+                            {
+                                queue!(
+                                    out,
+                                    Print(" ".repeat(
+                                        right.min(self.left + available) - column.max(self.left)
+                                    ))
+                                )?;
+                            } else {
+                                queue!(out, Print(character))?;
+                            }
+                        }
+                        column = right;
+                    }
+                    queue!(out, ResetColor)?;
+                } else {
+                    queue!(out, Print(window(text, self.left, available)))?;
+                }
             }
         }
         if focused {
@@ -291,6 +558,16 @@ impl Editor {
             queue!(out, MoveTo(x as u16, row), Show)?;
         }
         Ok(())
+    }
+}
+
+fn word_class(character: char) -> u8 {
+    if character.is_whitespace() {
+        0
+    } else if character.is_alphanumeric() || character == '_' {
+        1
+    } else {
+        2
     }
 }
 
@@ -351,6 +628,160 @@ mod tests {
         editor.input(key(KeyCode::End), 5);
         editor.input(key(KeyCode::Delete), 5);
         assert_eq!(editor.source(), "b='0'f='2'    # 世");
+    }
+
+    #[test]
+    fn selection_extends_shrinks_reverses_and_replaces_unicode_text() {
+        let mut editor = Editor::new("a界b\ncafé\nend");
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        editor.input(key(KeyCode::Right), 5);
+        editor.input(shift(KeyCode::Down), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("界b\nc"));
+        editor.input(shift(KeyCode::Right), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("界b\nca"));
+        editor.input(shift(KeyCode::Up), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("界"));
+        editor.input(shift(KeyCode::Left), 5);
+        assert!(editor.selected_text().is_none());
+        editor.input(shift(KeyCode::Left), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("a"));
+        editor.insert("Z\né");
+        assert_eq!(editor.source(), "Z\né界b\ncafé\nend");
+        assert_eq!(editor.position(), (2, 2));
+        assert!(editor.selected_text().is_none());
+    }
+
+    #[test]
+    fn selection_deletion_handles_newlines_and_the_entire_document() {
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        let mut editor = Editor::new("éx\n世界\nz");
+        editor.input(shift(KeyCode::Down), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("éx\n"));
+        assert!(editor.input(key(KeyCode::Delete), 5));
+        assert_eq!(editor.source(), "世界\nz");
+        assert_eq!(editor.position(), (1, 1));
+        editor.input(
+            KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            5,
+        );
+        assert_eq!(editor.selected_text().as_deref(), Some("世界\nz"));
+        assert!(editor.input(key(KeyCode::Backspace), 5));
+        assert_eq!(editor.source(), "");
+        assert_eq!(editor.position(), (1, 1));
+        assert!(!editor.input(key(KeyCode::Backspace), 5));
+        editor.insert("ab");
+        editor.input(shift(KeyCode::Home), 5);
+        assert!(editor.input(key(KeyCode::Char('x')), 5));
+        assert_eq!(editor.source(), "x");
+    }
+
+    #[test]
+    fn control_shift_navigation_selects_words_paragraphs_and_document_edges() {
+        let ctrl_shift = |code| KeyEvent::new(code, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        let mut editor = Editor::new("alpha_1 + 世界\nnext\n\nlast");
+        editor.input(ctrl_shift(KeyCode::Right), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha_1 "));
+        editor.input(ctrl_shift(KeyCode::Right), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha_1 + "));
+        editor.input(ctrl_shift(KeyCode::Right), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha_1 + 世界\n"));
+        editor.input(ctrl_shift(KeyCode::Left), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("alpha_1 + "));
+        editor.input(key(KeyCode::Left), 5);
+        assert_eq!(editor.position(), (1, 1));
+        assert!(editor.selected_text().is_none());
+        editor.input(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL), 5);
+        editor.input(ctrl_shift(KeyCode::Up), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("last"));
+        editor.input(ctrl_shift(KeyCode::Up), 5);
+        assert_eq!(
+            editor.selected_text().as_deref(),
+            Some(editor.source().as_str())
+        );
+        editor.input(ctrl_shift(KeyCode::Down), 5);
+        assert_eq!(editor.selected_text().as_deref(), Some("last"));
+        editor.input(ctrl_shift(KeyCode::Home), 5);
+        assert_eq!(
+            editor.selected_text().as_deref(),
+            Some(editor.source().as_str())
+        );
+        editor.input(ctrl_shift(KeyCode::End), 5);
+        assert!(editor.selected_text().is_none());
+        assert_eq!(editor.position(), (4, 5));
+    }
+
+    #[test]
+    fn plain_navigation_collapses_selection_and_empty_paste_preserves_it() {
+        let mut editor = Editor::new("a界b");
+        editor.input(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT), 1);
+        editor.insert("");
+        assert_eq!(editor.selected_text().as_deref(), Some("a界b"));
+        editor.input(key(KeyCode::Right), 1);
+        assert_eq!(editor.position(), (1, 4));
+        assert!(editor.selected_text().is_none());
+        editor.input(KeyEvent::new(KeyCode::Home, KeyModifiers::SHIFT), 1);
+        editor.input(key(KeyCode::Left), 1);
+        assert_eq!(editor.position(), (1, 1));
+        assert!(editor.selected_text().is_none());
+    }
+
+    #[test]
+    fn toggling_comments_preserves_indentation_selection_and_last_line_boundary() {
+        let source = "  b='1'\n\n  # existing\nf='2'";
+        let mut editor = Editor::new(source);
+        let comment = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT);
+        for _ in 0..3 {
+            editor.input(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), 5);
+        }
+        assert!(editor.input(comment, 5));
+        assert_eq!(editor.source(), "  # b='1'\n\n  # # existing\nf='2'");
+        assert_eq!(
+            editor.selected_text().as_deref(),
+            Some("  # b='1'\n\n  # # existing\n")
+        );
+        assert!(editor.input(comment, 5));
+        assert_eq!(editor.source(), source);
+        editor.input(key(KeyCode::Home), 5);
+        assert!(editor.input(comment, 5));
+        assert_eq!(editor.source(), "  b='1'\n\n  # existing\n# f='2'");
+        editor.input(key(KeyCode::End), 5);
+        assert!(editor.input(comment, 5));
+        assert_eq!(editor.source(), source);
+        assert_eq!(editor.position(), (4, 6));
+        let mut blank = Editor::new("  ");
+        assert!(!blank.input(comment, 5));
+        assert_eq!(blank.source(), "  ");
+        assert!(blank.input(key(KeyCode::Enter), 5));
+        assert_eq!(blank.source(), "\n  ");
+    }
+
+    #[test]
+    fn selection_highlighting_handles_scrolling_wide_characters_and_controls() {
+        let mut highlight = Vec::new();
+        queue!(highlight, SetBackgroundColor(Color::DarkBlue)).unwrap();
+        for width in [1, 6, 80] {
+            let mut editor = Editor::new("# 界界界\x1b\nnext");
+            editor.input(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT), 1);
+            let mut output = Vec::new();
+            editor.draw(&mut output, 0, 2, width, true).unwrap();
+            if width > 1 {
+                assert!(
+                    output
+                        .windows(highlight.len())
+                        .any(|part| part == highlight)
+                );
+            }
+            let output = String::from_utf8(output).unwrap();
+            assert!(!output.contains("\x1b\x1b"));
+            editor.input(key(KeyCode::Left), 1);
+            let mut output = Vec::new();
+            editor.draw(&mut output, 0, 2, width, true).unwrap();
+            assert!(
+                !output
+                    .windows(highlight.len())
+                    .any(|part| part == highlight)
+            );
+        }
     }
 
     #[test]

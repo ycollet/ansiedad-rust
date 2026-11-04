@@ -55,9 +55,9 @@ Ctrl-S creates `editme.txt` in the current directory; an existing file is never
 overwritten by a scratch buffer. To open an existing file, pass its path explicitly.
 The filename extension is optional: `ansiedad editme` and `ansiedad patch.txt`
 work just like `ansiedad editme.txt`. These are plain text files; their contents
-must use TOML syntax, regardless of the filename.
+use the assignment format described below, not TOML.
 
-The upper half renders visuals; the lower half is an interactive TOML editor,
+The upper half renders visuals; the lower half is an interactive text editor,
 initially focused. Type to preview valid changes
 immediately, without resetting time. Invalid drafts leave the last valid
 configuration running and display an error on the bottom line. Evaluation
@@ -69,14 +69,31 @@ advance time so a temporary division by zero does not permanently stall playback
 | Tab | Switch focus between the editor and visuals |
 | Ctrl-S | Save to the loaded file, or create `editme.txt` from a scratch buffer |
 | Ctrl-P / Ctrl-R | Pause/resume / reset time from either pane |
-| Ctrl-Q / Ctrl-C | Quit; repeat to discard an unsaved draft |
+| Ctrl-Q | Quit from either pane; repeat to discard an unsaved draft |
 | F5 | Reload a loaded/saved file; repeat to discard an unsaved draft |
 | Arrows, Home/End, Ctrl-Home/End, PageUp/Down | Navigate the editor |
+| Shift + navigation keys | Extend or shrink the editor selection |
+| Ctrl-Left/Right; Ctrl-Up/Down | Move by word; move by paragraph (blank-line-separated blocks) |
+| Ctrl-Shift + arrows; Ctrl-Shift-Home/End | Select by word/paragraph; select to the start/end of the document |
+| Ctrl-X / Ctrl-C / Ctrl-V (editor focus) | Cut / copy / paste using the system clipboard |
+| Alt-M (editor focus) | Toggle `#` comments on the current line or selected lines |
 | Enter, Backspace, Delete | Edit lines; multiline paste is supported |
 | Space / r / q / Esc (visual focus only) | Pause / reset / quit / quit |
+| Ctrl-C (visual focus only) | Quit; repeat to discard an unsaved draft |
 | Esc (editor focus) | Return focus to the visuals |
 
 The editor scrolls vertically and horizontally to keep the cursor visible.
+Selected text is highlighted; typing or pasting replaces it, and Backspace/Delete
+removes it. Cut and copy require a selection; without one, the status line reports
+"No text selected". Clipboard shortcuts use the system clipboard on the machine
+running ANSIedad. If it is unavailable (for example, in a headless SSH session),
+an error is shown; a failed cut does not delete the selection.
+
+Alt-M preserves indentation and skips blank lines. It uncomments the affected
+lines when all are commented, otherwise comments them. A selection ending at
+column one does not include that final line. Alt-M is used instead of Ctrl-M
+because terminals commonly send Ctrl-M as Enter.
+
 An asterisk in its header marks unsaved changes. Playback keys such as `q`,
 `r`, and Space insert text while editing rather than controlling playback.
 Ctrl-S rejects invalid drafts and refuses to overwrite a file changed externally.
@@ -87,10 +104,10 @@ Use a UTF-8 terminal and a monospace font with box-drawing/block glyphs.
 Your terminal's palette controls the appearance of ANSI colors 0 through 15.
 
 ```sh
-cargo run --release -- my-patch.toml
+cargo run --release -- my-patch.txt
 cargo run -- --init                # optional: create editme.txt
-cargo run -- --init my-patch.toml  # create an example; never overwrite
-cargo run -- --check my-patch.toml
+cargo run -- --init my-patch.txt  # create an example; never overwrite
+cargo run -- --check my-patch.txt
 cargo install --path .
 ansiedad --help
 ```
@@ -102,19 +119,51 @@ evaluation. `--frames N` runs a finite number of frames in an interactive termin
 
 ## Live expressions
 
+Patch files contain `name = value` assignments separated by newlines or `;`.
+`#` starts a comment through the end of the line. Separators and comment markers
+inside quoted strings are ordinary characters. Use single or double quotes
+around `b`, `f`, and `c` expressions and string constants; numeric settings and
+integer constants are unquoted. Both quote styles support the escapes `\\`,
+`\'`, `\"`, `\n`, `\r`, and `\t`. Strings cannot span physical lines.
+
 The built-in starter is deliberately simple:
 
-```toml
+```python
 b = "t >> 4"
 f = "15"
 c = "144"
 ```
 
-`b` is the background color, `f` the foreground, and `c` the character index.
-Settings not specified in the editor use the defaults shown below.
+### Reserved settings and built-ins
+
+These names configure the renderer, so they cannot be used for custom constants.
+All settings are optional. The defaults below apply when an assignment is omitted;
+the built-in starter above explicitly overrides `b`, `f`, and `c`.
+
+| Name | Expected type | Default | Meaning and allowed values |
+| --- | --- | --- | --- |
+| `b` | Quoted integer expression | `"0"` | Background color; the result is reduced modulo 256 to an index in `0..255`. |
+| `f` | Quoted integer expression | `"7"` | Foreground color; the result is reduced modulo 256 to an index in `0..255`. |
+| `c` | Quoted integer expression | `"0"` | Character-table index; the result is reduced modulo 224 to an index in `0..223`. |
+| `w` | Unquoted integer | `64` | Grid width in columns, `1..512`; clipped to the available visual pane. |
+| `l` | Unquoted integer | `16` | Grid height in rows, `1..512`; clipped to the available visual pane. |
+| `m` | Unquoted integer | `0` | Rendering mode: `0` redraws the grid; `1` scrolls within the visual pane. |
+| `s` | Unquoted number, integer or floating-point | `0.0` | Finite delay in seconds per visible row, `0..1`; batched into a delay per frame. |
+| `fps` | Unquoted integer | `30` | Maximum frame rate in frames per second, `1..240`; `s` may slow playback further. |
+
+For example, write `b = "t >> 4"` but `w = 64` and `s = 0.01`.
+Numeric settings take literal values, not expressions such as `w = 32*2`.
+
+Two other names are reserved inside expressions: `t` is the read-only integer
+cell counter, starting at zero, and `ord(...)` is the built-in function that
+returns a single character's integer Unicode code point. Neither can be assigned
+in a patch file. Other valid names define custom integer or string constants.
+
+### More examples
+
 For the original grayscale/block example, replace the editor contents with:
 
-```toml
+```python
 b = "(t*t>>17)%16+240"     # background, modulo 256
 f = "(t*t>>16)%16+240"     # foreground, modulo 256
 c = "144+(t^(t>>8))%4"    # character index, modulo 224
@@ -127,7 +176,7 @@ fps = 30                 # maximum frame rate, 1..240
 
 For colorful bitwise patterns:
 
-```toml
+```python
 b = "t<<5 ^ t>>1"
 f = "0"
 c = "0"
@@ -135,14 +184,31 @@ c = "0"
 
 For monochrome character patterns:
 
-```toml
+```python
 b = "7"
 f = "0"
 c = "222*((t*t>>(9+t%2))%2)+(188+(t>>(t>>10)%15)%4)"
 ```
 
-Use one set of `b`, `f`, and `c` assignments at a time; duplicate TOML keys
-are invalid. Dimensions and playback settings are optional.
+For the original bitmap and scrolling-text example:
+
+```python
+BYE = "ANSIedad...."; BITMAP = 0b0001001101010101000100100101011100000001010101010001001101100010
+b = "BITMAP >> ((t>>1)+(t>>10))%16 + (t>>7)%4*16 & 1 ^ (t>>9)%2 * t<<2"
+f = "t&1"; c = "(t%512<64)*(ord(BYE[t%12])-32)"
+```
+
+Declare integer or string constants directly alongside the settings; no
+`[constants]` section is needed or accepted. Constants may appear before or after
+the expressions that reference them. Names use ASCII letters, digits, and
+underscores, cannot start with a digit, and cannot be `t` or `ord`. Setting names
+(`b`, `f`, `c`, `w`, `l`, `m`, `s`, `fps`) are reserved for their settings.
+Names are case-sensitive. Remove leading `#` to enable commented-out examples.
+
+Use one set of `b`, `f`, and `c` assignments at a time; duplicate assignments
+are invalid, including constants. Dimensions and playback settings are optional.
+Existing simple assignment-only TOML files still work, regardless of extension;
+move any old `[constants]` entries to the top level and remove that heading.
 
 `t` starts at zero and increases once per rendered cell in row-major order.
 The grid is clipped to the upper pane, reserving the lower pane for editing
@@ -157,9 +223,19 @@ Operator precedence follows Python's arithmetic/bitwise rules; power is
 right-associative. Comparisons produce 0 or 1; use individual comparisons
 instead of Python-style comparison chains.
 
+`ord('A')` returns a character's Unicode code point. String literals or string
+constants can be indexed inside `ord`, as in `ord("abc"[t%3])` or
+`ord(BYE[t%12])`. Indexing counts Unicode characters, supports Python-style
+negative indices, and reports out-of-range indices as evaluation errors.
+Without an index, `ord` requires exactly one character. Expression string
+literals accept single or double quotes and the escapes `\\`, `\'`, `\"`,
+`\n`, `\r`, and `\t`; remember to escape them for the outer assignment string too.
+
 Unlike the original's arbitrary Python `eval`, expressions cannot execute
-code, access files, call functions, or reference custom variables. Python patch
-files must be translated into TOML manually. Both `/` and `//` perform integer
+code, access files, or call functions other than `ord`. Custom values must be
+integer or string constants; strings are only supported as `ord` arguments.
+The assignment format is a limited Python-like syntax, not a Python interpreter.
+Both `/` and `//` perform integer
 floor division, `%` follows Python's signed modulo, and arithmetic wraps at
 signed 64 bits instead of using Python's unlimited integers. Negative shifts,
 division by zero, and exponents outside `0..4294967295` are reported as errors.

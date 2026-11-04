@@ -34,6 +34,8 @@ Usage: ansiedad [OPTIONS] [CONFIG]
 
 Without CONFIG, start with a built-in example; no file is needed.
 Ctrl-S creates editme.txt. Pass CONFIG explicitly to load an existing file.
+CONFIG uses plain-text name = value assignments, separated by newlines or ';'.
+Use '#' for comments and quotes around b/f/c expressions and string constants.
 
   --init           Write an example CONFIG (default: editme.txt; never overwrite)
   --check          Validate CONFIG or the built-in example without a terminal
@@ -44,9 +46,11 @@ Ctrl-S creates editme.txt. Pass CONFIG explicitly to load an existing file.
   -h, --help       Show help
   -V, --version    Show version
 
-Keys: Tab: switch focus | Ctrl-S: save | Ctrl-Q / Ctrl-C: quit
+Keys: Tab: switch focus | Ctrl-S: save | Ctrl-Q: quit
       Ctrl-P: pause | Ctrl-R: reset | F5: reload from disk
-      In visual focus: Space: pause | r: reset | q / Esc: quit
+      In editor: Shift + navigation: select | Ctrl-Left/Right: move by word
+                 Ctrl-X/C/V: cut/copy/paste | Alt-M: toggle line comments
+      In visual focus: Space: pause | r: reset | q / Esc / Ctrl-C: quit
 Unsaved drafts require a second quit/reload key to discard.
 
 Requires a UTF-8 terminal with 256-color support.";
@@ -262,6 +266,51 @@ enum Confirm {
     Reload,
 }
 
+fn quit_requested(key: event::KeyEvent, editing: bool) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    control && key.code == KeyCode::Char('q')
+        || !editing
+            && (control && key.code == KeyCode::Char('c')
+                || matches!(key.code, KeyCode::Esc | KeyCode::Char('q')))
+}
+
+fn clipboard_input(
+    editor: &mut Editor,
+    clipboard: &mut Option<arboard::Clipboard>,
+    code: KeyCode,
+) -> Result<(bool, &'static str), String> {
+    let selected = if code == KeyCode::Char('v') {
+        None
+    } else {
+        let Some(text) = editor.selected_text() else {
+            return Ok((false, "No text selected"));
+        };
+        Some(text)
+    };
+    if clipboard.is_none() {
+        *clipboard = Some(
+            arboard::Clipboard::new().map_err(|error| format!("Clipboard unavailable: {error}"))?,
+        );
+    }
+    let clipboard = clipboard.as_mut().unwrap();
+    if let Some(text) = selected {
+        clipboard
+            .set_text(text)
+            .map_err(|error| format!("Could not copy selection: {error}"))?;
+        if code == KeyCode::Char('x') {
+            Ok((editor.delete_selection(), "Cut selection"))
+        } else {
+            Ok((false, "Copied selection"))
+        }
+    } else {
+        let text = clipboard
+            .get_text()
+            .map_err(|error| format!("Could not read clipboard: {error}"))?;
+        editor.insert(&text);
+        Ok((!text.is_empty(), "Pasted clipboard"))
+    }
+}
+
 fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(
@@ -278,6 +327,7 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
     let mut editing = true;
     let mut confirm = None;
     let mut notice: Option<String> = None;
+    let mut clipboard = None;
     let mut t = 0_i64;
     let mut paused = false;
     let mut dirty = true;
@@ -414,8 +464,7 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
-                    let quitting = control && matches!(key.code, KeyCode::Char('q' | 'c'))
-                        || !editing && matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
+                    let quitting = quit_requested(key, editing);
                     let reloading = key.code == KeyCode::F(5);
                     if reloading && args.path.is_none() {
                         confirm = None;
@@ -461,9 +510,19 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                     }
                     confirm = None;
                     notice = None;
+                    let mut edited = false;
                     match key.code {
                         KeyCode::Tab | KeyCode::BackTab => editing = !editing,
                         KeyCode::Esc if editing => editing = false,
+                        KeyCode::Char('x' | 'c' | 'v') if editing && control => {
+                            match clipboard_input(&mut editor, &mut clipboard, key.code) {
+                                Ok((changed, message)) => {
+                                    edited = changed;
+                                    notice = Some(message.into());
+                                }
+                                Err(error) => notice = Some(format!("ERROR: {error}")),
+                            }
+                        }
                         KeyCode::Char('s') if control => {
                             let path = args.path.clone().unwrap_or_else(|| "editme.txt".into());
                             notice = Some(match editor.save(&path) {
@@ -493,16 +552,17 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                             paused = !paused;
                             next_frame = Instant::now();
                         }
-                        _ if editing && editor.input(key, usize::from(layout.editor_height)) => {
-                            if let Some(config) = editor.preview() {
-                                live.config = config;
-                                live.error = None;
-                                runtime_error = None;
-                                dirty = true;
-                                next_frame = Instant::now();
-                            }
+                        _ if editing => {
+                            edited = editor.input(key, usize::from(layout.editor_height))
                         }
                         _ => {}
+                    }
+                    if edited && let Some(config) = editor.preview() {
+                        live.config = config;
+                        live.error = None;
+                        runtime_error = None;
+                        dirty = true;
+                        next_frame = Instant::now();
                     }
                 }
                 Event::Paste(text) if editing => {
@@ -570,6 +630,37 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_shortcuts_do_not_quit_the_editor() {
+        let control =
+            |character| event::KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
+        for character in ['c', 'x', 'v'] {
+            assert!(!quit_requested(control(character), true));
+        }
+        assert!(quit_requested(control('c'), false));
+        assert!(quit_requested(control('q'), true));
+        assert!(quit_requested(control('q'), false));
+        assert!(!quit_requested(
+            event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            true
+        ));
+    }
+
+    #[test]
+    fn copying_or_cutting_without_selection_does_not_open_clipboard_or_edit() {
+        let mut editor = Editor::new("b='t'");
+        let mut clipboard = None;
+        for character in ['c', 'x'] {
+            assert_eq!(
+                clipboard_input(&mut editor, &mut clipboard, KeyCode::Char(character)).unwrap(),
+                (false, "No text selected")
+            );
+            assert!(clipboard.is_none());
+            assert_eq!(editor.source(), "b='t'");
+            assert!(!editor.modified());
+        }
+    }
 
     #[test]
     fn frame_advances_time_in_row_major_order_and_reports_failed_cells() {

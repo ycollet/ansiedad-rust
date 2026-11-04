@@ -69,7 +69,7 @@ fn file_free_startup_and_explicit_config_errors() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("missing.toml"));
 
-    fs::write(directory.join("editme.txt"), "invalid TOML").unwrap();
+    fs::write(directory.join("editme.txt"), "invalid assignment").unwrap();
     assert!(
         run(&["--check"]).status.success(),
         "implicit files must not affect scratch mode"
@@ -89,6 +89,20 @@ fn file_free_startup_and_explicit_config_errors() {
         assert!(run(&["--check", name]).status.success());
         fs::remove_file(directory.join(name)).unwrap();
     }
+    let patch = directory.join("semicolons.txt");
+    fs::write(
+        &patch,
+        "BYE='ANSIedad....'; BITMAP=0b1010 # text constants need no section\n\
+         b='BITMAP&t'; f='t&1'; c='ord(BYE[t%12])-32'\n",
+    )
+    .unwrap();
+    let output = run(&["--check", "semicolons.txt"]);
+    assert!(output.status.success(), "{:?}", output);
+    fs::write(&patch, "b='0'; invalid statement\n").unwrap();
+    let output = run(&["--check", "semicolons.txt"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("line 1:"));
+    fs::remove_file(patch).unwrap();
     fs::remove_file(directory.join("editme.txt")).unwrap();
     fs::remove_dir(directory).unwrap();
 }
