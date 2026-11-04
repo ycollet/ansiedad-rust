@@ -1,4 +1,4 @@
-use crate::config::Config;
+use ansiedad::config::Config;
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{KeyCode, KeyEvent, KeyModifiers},

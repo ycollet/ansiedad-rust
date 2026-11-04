@@ -4,8 +4,18 @@ version = "0.1.0"
 edition = "2024"
 description = "Live-coded ANSI bytebeat visuals in your terminal"
 license = "AGPL-3.0-only"
+default-run = "ansiedad"
+
+[features]
+gui = ["dep:eframe"]
+
+[[bin]]
+name = "ansiedad-gui"
+path = "src/bin/ansiedad-gui.rs"
+required-features = ["gui"]
 
 [dependencies]
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 crossterm = "0.29"
+eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 unicode-width = "0.2"

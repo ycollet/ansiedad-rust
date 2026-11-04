@@ -1,0 +1,4 @@
+# RGBA pixels: alpha 192 blends with the preview backdrop.
+mode = 1
+w = 160; l = 100; fps = 30
+rgba = "(((x*2+frame)&255)<<24)|(((y*2+frame)&255)<<16)|(((x^y^frame)&255)<<8)|192"

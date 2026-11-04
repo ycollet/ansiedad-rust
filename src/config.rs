@@ -1,4 +1,4 @@
-use crate::expr::{Constant, Expr, parse_integer, parse_string};
+use crate::expr::{Constant, Context, Expr, parse_integer, parse_string};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -46,7 +46,7 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn parse(source: &str) -> Result<Self, String> {
+    pub(crate) fn parse(source: &str) -> Result<Self, String> {
         let mut settings = Self::default();
         let mut assigned = BTreeSet::new();
         for (index, line) in source.lines().enumerate() {
@@ -55,6 +55,22 @@ impl Settings {
                 .map_err(|error| format!("line {}: {error}", index + 1))?;
         }
         Ok(settings)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(1..=512).contains(&self.w) || !(1..=512).contains(&self.l) {
+            return Err("w and l must be between 1 and 512".into());
+        }
+        if self.m > 1 {
+            return Err("m must be 0 (redraw) or 1 (scroll)".into());
+        }
+        if !self.s.is_finite() || !(0.0..=1.0).contains(&self.s) {
+            return Err("s must be a finite number between 0 and 1 seconds".into());
+        }
+        if !(1..=240).contains(&self.fps) {
+            return Err("fps must be between 1 and 240".into());
+        }
+        Ok(())
     }
 
     fn parse_line(&mut self, line: &str, assigned: &mut BTreeSet<String>) -> Result<(), String> {
@@ -159,20 +175,18 @@ pub struct Cell {
 impl Config {
     pub fn parse(source: &str) -> Result<Self, String> {
         let settings = Settings::parse(source)?;
-        if !(1..=512).contains(&settings.w) || !(1..=512).contains(&settings.l) {
-            return Err("w and l must be between 1 and 512".into());
-        }
-        if settings.m > 1 {
-            return Err("m must be 0 (redraw) or 1 (scroll)".into());
-        }
-        if !settings.s.is_finite() || !(0.0..=1.0).contains(&settings.s) {
-            return Err("s must be a finite number between 0 and 1 seconds".into());
-        }
-        if !(1..=240).contains(&settings.fps) {
-            return Err("fps must be between 1 and 240".into());
-        }
+        Self::from_settings(settings, false)
+    }
+
+    pub(crate) fn from_settings(settings: Settings, canvas: bool) -> Result<Self, String> {
+        settings.validate()?;
         let parse = |name, source: &str| {
-            Expr::parse(source, &settings.constants).map_err(|e| format!("{name}: {e}"))
+            if canvas {
+                Expr::parse_canvas(source, &settings.constants)
+            } else {
+                Expr::parse(source, &settings.constants)
+            }
+            .map_err(|e| format!("{name}: {e}"))
         };
         let background = parse("b", &settings.b)?;
         let foreground = parse("f", &settings.f)?;
@@ -198,14 +212,25 @@ impl Config {
     }
 
     pub fn cell(&self, t: i64) -> Result<Cell, String> {
-        let eval = |name, expr: &Expr| expr.eval(t).map_err(|e| format!("{name} at t={t}: {e}"));
+        self.cell_context(Context {
+            t,
+            ..Context::default()
+        })
+    }
+
+    pub fn cell_context(&self, context: Context) -> Result<Cell, String> {
+        let t = context.t;
+        let eval = |name, expr: &Expr| {
+            expr.eval_context(context)
+                .map_err(|e| format!("{name} at t={t}: {e}"))
+        };
         Ok(Cell {
             background: eval("b", &self.background)?.rem_euclid(256) as u8,
             foreground: eval("f", &self.foreground)?.rem_euclid(256) as u8,
             character: if self.character.is_text() {
                 let character = self
                     .character
-                    .eval_character(t)
+                    .eval_character_context(context)
                     .map_err(|error| format!("c at t={t}: {error}"))?;
                 if character.is_control() || character.width() != Some(1) {
                     return Err(format!(

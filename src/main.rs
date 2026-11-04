@@ -1,8 +1,6 @@
-mod config;
 mod editor;
-mod expr;
 
-use config::{Cell, LiveConfig};
+use ansiedad::config::{self, Cell, LiveConfig};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{

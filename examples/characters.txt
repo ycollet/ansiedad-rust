@@ -1,0 +1,6 @@
+# Character rendering in the graphical app.
+mode = 0
+w = 64; l = 16; fps = 30
+TEXT = "ANSIedad "
+b = "(x+y+frame)&255"; f = "15"
+c = "TEXT[(x+frame//4)%len(TEXT)]"

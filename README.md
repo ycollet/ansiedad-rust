@@ -117,6 +117,77 @@ file otherwise. Missing or invalid explicit files are reported as errors.
 It validates syntax and settings, not every possible time-dependent
 evaluation. `--frames N` runs a finite number of frames in an interactive terminal.
 
+## Graphical application (optional)
+
+`ansiedad-gui` is a separate egui/eframe application with a live text editor and
+a graphical canvas. The console executable, its patch syntax, and the default
+build remain unchanged. GUI dependencies are enabled only with the `gui` feature.
+A desktop session and an OpenGL-capable graphics driver are required to open
+the window; `--check` and `--init` do not require a display.
+
+```sh
+cargo run --release --features gui --bin ansiedad-gui
+cargo run --release --features gui --bin ansiedad-gui -- examples/pixels.txt
+cargo run --release --features gui --bin ansiedad-gui -- examples/characters.txt
+cargo run --features gui --bin ansiedad-gui -- --check examples/pixels.txt
+cargo run --features gui --bin ansiedad-gui -- --init canvas.txt
+cargo install --path . --features gui --bin ansiedad-gui
+ansiedad-gui --help
+```
+
+The GUI uses the same plain-text assignments, comments, constants, operators,
+string indexing, `ord()`, and `len()`. Existing console patches open in character
+mode by default. These additional names are reserved **only in graphical patches**:
+
+| Name | Type / default | Meaning |
+| --- | --- | --- |
+| `mode` | Unquoted integer, `0` | `0`: character grid using `b`, `f`, and `c`; `1`: pixel canvas using `rgba`. |
+| `rgba` | Quoted integer expression, `"0x000000ff"` | Packed `0xRRGGBBAA` color; the low 32 bits are used. `AA = ff` is opaque; `AA = 00` is transparent. |
+| `x`, `y` | Read-only integers | Zero-based column and row of the current character or pixel. |
+| `frame` | Read-only integer | Animation frame counter, starting at zero and increasing once per rendered frame. |
+
+`w` and `l` are character columns/rows in mode 0 and pixel width/height in mode 1,
+each `1..512`. `t` retains its console meaning: it advances once per sample in
+row-major order, while `frame` is shared by every sample in a frame. Pause freezes
+both counters; reset sets both to zero. `fps` and `s` control frame timing as in
+the console. Console scrolling (`m`) has no effect in the graphical window.
+Character mode uses the original glyph table with a fixed xterm-style 256-color
+palette rather than the terminal emulator's palette.
+
+For translucent animated pixels:
+
+```python
+mode = 1
+w = 160; l = 100; fps = 30
+rgba = "(((x*2+frame)&255)<<24)|(((y*2+frame)&255)<<16)|(((x^y^frame)&255)<<8)|192"
+```
+
+To assemble the four 8-bit channels of `0xRRGGBBAA` dynamically:
+
+```python
+rgba = "((x&255)<<24) | ((y&255)<<16) | (128<<8) | 255"
+```
+
+This uses `x` for red and `y` for green (each masked to `0..255`), a fixed blue
+value of `128`, and full opacity (`255`). Shift red by 24 bits, green by 16,
+and blue by 8; alpha occupies the lowest 8 bits. Combine the channels with `|`.
+
+Pixels are scaled with nearest-neighbor filtering, with integer scaling when
+enlarged. Alpha blends against the optional checkerboard (or black when disabled);
+it does not accumulate previous frames or create motion trails.
+
+Edit `mode` in the patch to switch renderers; choose suitable `w`/`l` values for
+the new mode. Pause/resume and reset buttons are above the editor. The editor
+provides native selection, copy/paste, and undo/redo. Invalid drafts keep the last
+valid configuration running; evaluation errors keep the last complete frame
+visible and advance time so transient errors can recover.
+
+Enter a path and use **Open / reload** or **Save** (`Ctrl-S`, or `Cmd-S` on macOS).
+Saving rejects invalid drafts, refuses to overwrite a new path, and checks loaded
+files for external changes. Opening a file or closing the window requires
+confirmation when the draft is modified. Reloading is manual in the GUI.
+`--frames N` closes the window after a finite number of frames.
+
 ## Live expressions
 
 Patch files contain `name = value` assignments separated by newlines or `;`.
@@ -274,6 +345,9 @@ solid block. For color-only visuals set `c = "0"` and animate `b`.
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+# Include the optional graphical application:
+cargo test --features gui
+cargo clippy --features gui --all-targets -- -D warnings
 ```
 
 ## Attribution and license

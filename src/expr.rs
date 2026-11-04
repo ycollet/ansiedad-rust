@@ -81,12 +81,23 @@ pub fn parse_string(source: &str, pos: &mut usize) -> Result<String, Error> {
 pub enum Expr {
     Number(i64),
     Time,
+    X,
+    Y,
+    Frame,
     Text(Arc<[char]>),
     CharacterAt(Box<Expr>, Box<Expr>),
     Ord(Box<Expr>),
     Length(Box<Expr>),
     Unary(Op, Box<Expr>),
     Binary(Op, Box<Expr>, Box<Expr>),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Context {
+    pub t: i64,
+    pub x: i64,
+    pub y: i64,
+    pub frame: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +137,21 @@ enum Token {
 
 impl Expr {
     pub fn parse(source: &str, constants: &BTreeMap<String, Constant>) -> Result<Self, Error> {
+        Self::parse_internal(source, constants, false)
+    }
+
+    pub fn parse_canvas(
+        source: &str,
+        constants: &BTreeMap<String, Constant>,
+    ) -> Result<Self, Error> {
+        Self::parse_internal(source, constants, true)
+    }
+
+    fn parse_internal(
+        source: &str,
+        constants: &BTreeMap<String, Constant>,
+        canvas: bool,
+    ) -> Result<Self, Error> {
         if source.len() > 4096 {
             return Err(Error("expression exceeds 4096 bytes".into()));
         }
@@ -134,6 +160,7 @@ impl Expr {
             tokens,
             pos: 0,
             constants,
+            canvas,
         };
         let expr = parser.expression(0, 0)?;
         if parser.peek() != &Token::End {
@@ -143,22 +170,32 @@ impl Expr {
     }
 
     pub fn eval(&self, t: i64) -> Result<i64, Error> {
+        self.eval_context(Context {
+            t,
+            ..Context::default()
+        })
+    }
+
+    pub fn eval_context(&self, context: Context) -> Result<i64, Error> {
         match self {
             Self::Number(n) => Ok(*n),
-            Self::Time => Ok(t),
+            Self::Time => Ok(context.t),
+            Self::X => Ok(context.x),
+            Self::Y => Ok(context.y),
+            Self::Frame => Ok(context.frame),
             Self::Text(_) | Self::CharacterAt(_, _) => Err(Error(
                 "expected an integer; use ord(...) to convert a character".into(),
             )),
-            Self::Ord(value) => Ok(i64::from(u32::from(value.eval_character(t)?))),
+            Self::Ord(value) => Ok(i64::from(u32::from(value.eval_character_context(context)?))),
             Self::Length(value) => match value.as_ref() {
                 Self::Text(text) => Ok(text.len() as i64),
                 _ => {
-                    value.eval_character(t)?;
+                    value.eval_character_context(context)?;
                     Ok(1)
                 }
             },
             Self::Unary(op, value) => {
-                let value = value.eval(t)?;
+                let value = value.eval_context(context)?;
                 match op {
                     Op::Add => Ok(value),
                     Op::Sub => Ok(value.wrapping_neg()),
@@ -167,8 +204,8 @@ impl Expr {
                 }
             }
             Self::Binary(op, left, right) => {
-                let a = left.eval(t)?;
-                let b = right.eval(t)?;
+                let a = left.eval_context(context)?;
+                let b = right.eval_context(context)?;
                 Ok(match op {
                     Op::Add => a.wrapping_add(b),
                     Op::Sub => a.wrapping_sub(b),
@@ -226,6 +263,13 @@ impl Expr {
     }
 
     pub fn eval_character(&self, t: i64) -> Result<char, Error> {
+        self.eval_character_context(Context {
+            t,
+            ..Context::default()
+        })
+    }
+
+    pub fn eval_character_context(&self, context: Context) -> Result<char, Error> {
         match self {
             Self::Text(text) if text.len() == 1 => Ok(text[0]),
             Self::Text(_) => Err(Error(
@@ -233,7 +277,7 @@ impl Expr {
             )),
             Self::CharacterAt(source, index) => match source.as_ref() {
                 Self::Text(text) => {
-                    let index = index.eval(t)?;
+                    let index = index.eval_context(context)?;
                     let len = text.len() as i64;
                     let index = if index < 0 { len + index } else { index };
                     usize::try_from(index)
@@ -243,8 +287,8 @@ impl Expr {
                         .ok_or_else(|| Error("string index out of range".into()))
                 }
                 _ => {
-                    let character = source.eval_character(t)?;
-                    if matches!(index.eval(t)?, 0 | -1) {
+                    let character = source.eval_character_context(context)?;
+                    if matches!(index.eval_context(context)?, 0 | -1) {
                         Ok(character)
                     } else {
                         Err(Error("string index out of range".into()))
@@ -347,6 +391,7 @@ struct Parser<'a> {
     tokens: Vec<Token>,
     pos: usize,
     constants: &'a BTreeMap<String, Constant>,
+    canvas: bool,
 }
 
 impl Parser<'_> {
@@ -363,6 +408,9 @@ impl Parser<'_> {
         let mut left = match token {
             Token::Number(n) => Expr::Number(n),
             Token::Identifier(name) if name == "t" => Expr::Time,
+            Token::Identifier(name) if self.canvas && name == "x" => Expr::X,
+            Token::Identifier(name) if self.canvas && name == "y" => Expr::Y,
+            Token::Identifier(name) if self.canvas && name == "frame" => Expr::Frame,
             Token::Text(text) => Expr::Text(text.chars().collect()),
             Token::Identifier(name) if matches!(name.as_str(), "ord" | "len") => {
                 self.function(&name, depth + 1)?
@@ -636,5 +684,31 @@ mod tests {
         }
         assert!(parse(&format!("{}t{}", "(".repeat(70), ")".repeat(70))).is_err());
         assert!(parse(&"t+".repeat(3000)).is_err());
+    }
+
+    #[test]
+    fn canvas_context_propagates_through_strings_and_arithmetic_without_reserving_console_names() {
+        let expression =
+            Expr::parse_canvas("ord('AB'[x])+len('ab'[y])+frame+t", &BTreeMap::new()).unwrap();
+        let context = Context {
+            t: 5,
+            x: 1,
+            y: 0,
+            frame: 3,
+        };
+        assert_eq!(expression.eval_context(context).unwrap(), 75);
+        let constants = BTreeMap::from([
+            ("x".into(), Constant::Integer(20)),
+            ("y".into(), Constant::Integer(2)),
+            ("frame".into(), Constant::Integer(3)),
+        ]);
+        assert_eq!(
+            Expr::parse("x+y+frame", &constants)
+                .unwrap()
+                .eval(0)
+                .unwrap(),
+            25
+        );
+        assert!(Expr::parse("x", &BTreeMap::new()).is_err());
     }
 }
