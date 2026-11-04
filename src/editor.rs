@@ -1,4 +1,7 @@
-use ansiedad::config::Config;
+use ansiedad::{
+    config::Config,
+    editing::{self, Navigation, Position},
+};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{KeyCode, KeyEvent, KeyModifiers},
@@ -12,12 +15,6 @@ use std::{
     path::Path,
 };
 use unicode_width::UnicodeWidthChar;
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Position {
-    row: usize,
-    col: usize,
-}
 
 pub struct Editor {
     lines: Vec<String>,
@@ -246,10 +243,10 @@ impl Editor {
                     return true;
                 }
             }
-            KeyCode::Left if control => self.word_left(),
-            KeyCode::Right if control => self.word_right(),
-            KeyCode::Up if control => self.paragraph_up(),
-            KeyCode::Down if control => self.paragraph_down(),
+            KeyCode::Left if control => self.navigate(Navigation::WordLeft),
+            KeyCode::Right if control => self.navigate(Navigation::WordRight),
+            KeyCode::Up if control => self.navigate(Navigation::ParagraphUp),
+            KeyCode::Down if control => self.navigate(Navigation::ParagraphDown),
             KeyCode::Left => self.move_left(),
             KeyCode::Right => self.move_right(),
             KeyCode::Up => {
@@ -303,111 +300,17 @@ impl Editor {
         }
     }
 
-    fn previous_char(&self) -> Option<char> {
-        if self.col == 0 {
-            (self.row > 0).then_some('\n')
-        } else {
-            self.lines[self.row].chars().nth(self.col - 1)
-        }
-    }
-
-    fn next_char(&self) -> Option<char> {
-        self.lines[self.row]
-            .chars()
-            .nth(self.col)
-            .or_else(|| (self.row + 1 < self.lines.len()).then_some('\n'))
-    }
-
-    fn word_left(&mut self) {
-        while self.previous_char().is_some_and(char::is_whitespace) {
-            self.move_left();
-        }
-        let class = self.previous_char().map(word_class);
-        while class.is_some() && self.previous_char().map(word_class) == class {
-            self.move_left();
-        }
-    }
-
-    fn word_right(&mut self) {
-        let class = self.next_char().map(word_class);
-        while class.is_some() && self.next_char().map(word_class) == class {
-            self.move_right();
-        }
-        while self.next_char().is_some_and(char::is_whitespace) {
-            self.move_right();
-        }
-    }
-
-    fn paragraph_up(&mut self) {
-        if self.col == 0 {
-            self.row = self.row.saturating_sub(1);
-        }
-        while self.row > 0 && self.lines[self.row].trim().is_empty() {
-            self.row -= 1;
-        }
-        while self.row > 0 && !self.lines[self.row - 1].trim().is_empty() {
-            self.row -= 1;
-        }
-        self.col = 0;
-    }
-
-    fn paragraph_down(&mut self) {
-        while self.row < self.lines.len() && !self.lines[self.row].trim().is_empty() {
-            self.row += 1;
-        }
-        while self.row < self.lines.len() && self.lines[self.row].trim().is_empty() {
-            self.row += 1;
-        }
-        if self.row == self.lines.len() {
-            self.row -= 1;
-            self.col = self.lines[self.row].chars().count();
-        } else {
-            self.col = 0;
-        }
+    fn navigate(&mut self, navigation: Navigation) {
+        let position = editing::navigate(&self.source(), self.cursor(), navigation);
+        self.row = position.row;
+        self.col = position.col;
     }
 
     fn toggle_comments(&mut self) -> bool {
-        let (first, last) = match self.selection() {
-            Some((start, end)) => (start.row, end.row - usize::from(end.col == 0)),
-            None => (self.row, self.row),
-        };
-        let uncomment = self.lines[first..=last]
-            .iter()
-            .filter(|line| !line.trim().is_empty())
-            .all(|line| line.trim_start().starts_with('#'));
-        let mut changed = false;
-        for row in first..=last {
-            let line = &mut self.lines[row];
-            let byte = line.len() - line.trim_start().len();
-            if byte == line.len() {
-                continue;
-            }
-            let indent = line[..byte].chars().count();
-            let removed = if uncomment {
-                let count = if line[byte..].starts_with("# ") { 2 } else { 1 };
-                line.replace_range(byte..byte + count, "");
-                count
-            } else {
-                line.insert_str(byte, "# ");
-                0
-            };
-            let adjust = |position: &mut Position| {
-                if position.row == row && position.col > indent {
-                    position.col = if uncomment {
-                        indent + (position.col - indent).saturating_sub(removed)
-                    } else {
-                        position.col + 2
-                    };
-                }
-            };
-            let mut cursor = self.cursor();
-            adjust(&mut cursor);
-            self.col = cursor.col;
-            if let Some(anchor) = &mut self.anchor {
-                adjust(anchor);
-            }
-            changed = true;
-        }
+        let mut cursor = self.cursor();
+        let changed = editing::toggle_comments(&mut self.lines, &mut cursor, self.anchor.as_mut());
+        self.row = cursor.row;
+        self.col = cursor.col;
         changed
     }
 
@@ -558,16 +461,6 @@ impl Editor {
             queue!(out, MoveTo(x as u16, row), Show)?;
         }
         Ok(())
-    }
-}
-
-fn word_class(character: char) -> u8 {
-    if character.is_whitespace() {
-        0
-    } else if character.is_alphanumeric() || character == '_' {
-        1
-    } else {
-        2
     }
 }
 

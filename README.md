@@ -177,15 +177,32 @@ enlarged. Alpha blends against the optional checkerboard (or black when disabled
 it does not accumulate previous frames or create motion trails.
 
 Edit `mode` in the patch to switch renderers; choose suitable `w`/`l` values for
-the new mode. Pause/resume and reset buttons are above the editor. The editor
-provides native selection, copy/paste, and undo/redo. Invalid drafts keep the last
+the new mode. Editor changes apply automatically. Invalid drafts keep the last
 valid configuration running; evaluation errors keep the last complete frame
 visible and advance time so transient errors can recover.
+
+| GUI shortcut | Action |
+| --- | --- |
+| Shift + arrows / Home / End | Extend the text selection |
+| Ctrl + Left / Right, Ctrl + Up / Down | Jump by word or paragraph; add Shift to select |
+| Ctrl + Home / End | Jump to the start/end of the patch; add Shift to select |
+| Ctrl-X / Ctrl-C / Ctrl-V | Cut / copy / paste the selection using the system clipboard |
+| Alt-M | Toggle `#` comments on the current line or selected lines |
+| Ctrl-S | Save |
+| F5 | Reload the currently loaded file |
+| Ctrl-P / Ctrl-R | Pause/resume / reset time |
+| Ctrl-Q | Quit, with confirmation for unsaved changes |
+
+Selection, navigation, clipboard, and comment shortcuts act in the patch editor.
+Native platform shortcuts remain available, including Cmd-X/C/V/S and Cmd-Z /
+Cmd-Shift-Z on macOS, and Ctrl-Z / Ctrl-Shift-Z for undo/redo on other platforms.
+Alt-M preserves indentation and skips blank lines, just as in the console.
 
 Enter a path and use **Open / reload** or **Save** (`Ctrl-S`, or `Cmd-S` on macOS).
 Saving rejects invalid drafts, refuses to overwrite a new path, and checks loaded
 files for external changes. Opening a file or closing the window requires
-confirmation when the draft is modified. Reloading is manual in the GUI.
+confirmation when the draft is modified. Reloading is manual in the GUI; F5
+reloads the loaded file even if you have edited the Path field.
 `--frames N` closes the window after a finite number of frames.
 
 ## Live expressions

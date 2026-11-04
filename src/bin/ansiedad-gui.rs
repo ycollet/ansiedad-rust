@@ -1,5 +1,7 @@
 use ansiedad::canvas::{self, CanvasConfig, CanvasFrame, ansi_color};
+use ansiedad::editing::{self, Navigation, Position};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, TextureOptions, Vec2};
+use egui::text::{CCursor, CCursorRange};
 use std::{
     env, fs,
     io::Write,
@@ -23,7 +25,12 @@ Without PATCH, open a built-in pixel animation. The console app is unchanged.
 mode = 0: character grid using b/f/c
 mode = 1: pixels using rgba = \"0xRRGGBBAA\"
 w/l: columns/rows or pixel width/height, each 1..512
-x/y: zero-based coordinates; frame: frame counter; t: sample counter";
+x/y: zero-based coordinates; frame: frame counter; t: sample counter
+
+Editor: Shift + navigation selects; Ctrl-Shift + arrows selects words/paragraphs.
+        Ctrl-X/C/V: cut/copy/paste | Alt-M: toggle comments
+        Native Cmd clipboard shortcuts remain available on macOS.
+Ctrl-S: save | Ctrl-P: pause/resume | Ctrl-R: reset | Ctrl-Q: quit | F5: reload";
 
 #[derive(Default)]
 struct Args {
@@ -67,6 +74,80 @@ fn args() -> Result<Option<Args>, String> {
     Ok(Some(result))
 }
 
+fn patch_editor_id() -> egui::Id {
+    egui::Id::unique("patch-editor")
+}
+
+fn control_navigation(key: egui::Key, modifiers: egui::Modifiers) -> Option<Navigation> {
+    if !modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
+        return None;
+    }
+    Some(match key {
+        egui::Key::ArrowLeft => Navigation::WordLeft,
+        egui::Key::ArrowRight => Navigation::WordRight,
+        egui::Key::ArrowUp => Navigation::ParagraphUp,
+        egui::Key::ArrowDown => Navigation::ParagraphDown,
+        egui::Key::Home => Navigation::Start,
+        egui::Key::End => Navigation::End,
+        _ => return None,
+    })
+}
+
+fn move_selection(source: &str, range: &mut CCursorRange, navigation: Navigation, selecting: bool) {
+    let position = if !selecting && !range.is_empty() {
+        let [start, end] = range.sorted_cursors();
+        match navigation {
+            Navigation::WordLeft => Position::from_index(source, start.index.0),
+            Navigation::WordRight => Position::from_index(source, end.index.0),
+            _ => editing::navigate(
+                source,
+                Position::from_index(source, range.primary.index.0),
+                navigation,
+            ),
+        }
+    } else {
+        editing::navigate(
+            source,
+            Position::from_index(source, range.primary.index.0),
+            navigation,
+        )
+    };
+    range.primary = CCursor::new(position.index(source));
+    if !selecting {
+        range.secondary = range.primary;
+    }
+    range.h_pos = None;
+}
+
+fn custom_editor_key(event: &egui::Event) -> bool {
+    let egui::Event::Key {
+        key,
+        modifiers,
+        pressed: true,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    control_navigation(*key, *modifiers).is_some()
+        || *key == egui::Key::M && *modifiers == egui::Modifiers::ALT
+        || modifiers.ctrl
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+            && matches!(
+                key,
+                egui::Key::S | egui::Key::P | egui::Key::R | egui::Key::Q
+            )
+        || *key == egui::Key::S && modifiers.command && !modifiers.alt && !modifiers.shift
+        || *key == egui::Key::F5
+        || cfg!(target_os = "macos")
+            && modifiers.ctrl
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+            && !modifiers.shift
+            && matches!(key, egui::Key::C | egui::Key::X | egui::Key::V)
+}
+
 enum Pending {
     Open(PathBuf),
     Close,
@@ -93,6 +174,9 @@ struct App {
     frame_limit: Option<u64>,
     rendered: u64,
     outcome: Arc<Mutex<Option<String>>>,
+    clipboard: Option<arboard::Clipboard>,
+    reset_editor: bool,
+    deferred_events: Vec<egui::Event>,
 }
 
 impl App {
@@ -128,6 +212,9 @@ impl App {
             frame_limit,
             rendered: 0,
             outcome,
+            clipboard: None,
+            reset_editor: true,
+            deferred_events: Vec::new(),
         }
     }
 
@@ -195,7 +282,139 @@ impl App {
         self.runtime_error = None;
         self.notice = Some("Opened patch".into());
         self.dirty = true;
+        self.reset_editor = true;
         Ok(())
+    }
+
+    fn request_open(&mut self, path: PathBuf) {
+        if self.modified() {
+            self.pending = Some(Pending::Open(path));
+        } else if let Err(error) = self.open_file(path) {
+            self.notice = Some(format!("ERROR: {error}"));
+        }
+    }
+
+    fn shortcuts(&mut self, context: &egui::Context) {
+        let pressed = |modifiers, key| context.input_mut(|input| input.consume_key(modifiers, key));
+        if (pressed(egui::Modifiers::CTRL, egui::Key::S)
+            || pressed(egui::Modifiers::COMMAND, egui::Key::S))
+            && let Err(error) = self.save_file()
+        {
+            self.notice = Some(format!("ERROR: {error}"));
+        }
+        if pressed(egui::Modifiers::CTRL, egui::Key::P) {
+            self.paused = !self.paused;
+            self.next_frame = Instant::now();
+        }
+        if pressed(egui::Modifiers::CTRL, egui::Key::R) {
+            self.t = 0;
+            self.frame = 0;
+            self.dirty = true;
+        }
+        if pressed(egui::Modifiers::CTRL, egui::Key::Q) {
+            if self.modified() {
+                self.pending = Some(Pending::Close);
+            } else {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if pressed(egui::Modifiers::NONE, egui::Key::F5) {
+            if let Some(path) = self.path.clone() {
+                self.request_open(path);
+            } else {
+                self.notice = Some("No file loaded; save the patch first".into());
+            }
+        }
+    }
+
+    fn patch_editor(&mut self, ui: &mut egui::Ui) -> bool {
+        let id = patch_editor_id();
+        let context = ui.ctx().clone();
+        if self.reset_editor {
+            egui::TextEdit::store_state(&context, id, egui::text_edit::TextEditState::default());
+            context.memory_mut(|memory| memory.request_focus(id));
+            self.reset_editor = false;
+        }
+        let focused = context.memory(|memory| memory.has_focus(id));
+        let mut state = egui::TextEdit::load_state(&context, id).unwrap_or_default();
+        let mut range = state.cursor.char_range().unwrap_or_default();
+        let mut moved = false;
+        if focused {
+            context.input_mut(|input| {
+                input.events.retain(|event| {
+                    if let egui::Event::Key {
+                        key,
+                        modifiers,
+                        pressed: true,
+                        ..
+                    } = event
+                        && let Some(navigation) = control_navigation(*key, *modifiers)
+                    {
+                        move_selection(&self.source, &mut range, navigation, modifiers.shift);
+                        moved = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            });
+        }
+        if moved {
+            state.cursor.set_char_range(Some(range));
+            state.store(&context, id);
+        }
+        let comment = focused
+            && context.input_mut(|input| input.consume_key(egui::Modifiers::ALT, egui::Key::M));
+        let mut output = egui::TextEdit::multiline(&mut self.source)
+            .id(id)
+            .code_editor()
+            .desired_width(f32::INFINITY)
+            .desired_rows(30)
+            .show(ui);
+        if comment {
+            let range = output.state.cursor.char_range().unwrap_or_default();
+            let mut undoer = output.state.undoer();
+            undoer.add_undo(&(range, self.source.clone()));
+            let mut cursor = Position::from_index(&self.source, range.primary.index.0);
+            let mut anchor = Position::from_index(&self.source, range.secondary.index.0);
+            let mut lines: Vec<String> = self.source.split('\n').map(String::from).collect();
+            if editing::toggle_comments(&mut lines, &mut cursor, Some(&mut anchor)) {
+                self.source = lines.join("\n");
+                let range = CCursorRange::two(
+                    CCursor::new(anchor.index(&self.source)),
+                    CCursor::new(cursor.index(&self.source)),
+                );
+                undoer.add_undo(&(range, self.source.clone()));
+                output.state.set_undoer(undoer);
+                output.state.cursor.set_char_range(Some(range));
+                output.state.clone().store(&context, id);
+                output.response.mark_changed();
+                moved = true;
+                context.request_repaint();
+            }
+        }
+        if moved && let Some(range) = output.state.cursor.char_range() {
+            let cursor = output
+                .galley
+                .pos_from_cursor(range.primary)
+                .translate(output.galley_pos.to_vec2());
+            ui.scroll_to_rect(cursor, None);
+        }
+        output.response.changed()
+    }
+
+    fn clipboard_text(&mut self) -> Result<String, String> {
+        if self.clipboard.is_none() {
+            self.clipboard = Some(
+                arboard::Clipboard::new()
+                    .map_err(|error| format!("Clipboard unavailable: {error}"))?,
+            );
+        }
+        self.clipboard
+            .as_mut()
+            .expect("clipboard initialized")
+            .get_text()
+            .map_err(|error| format!("Could not read clipboard: {error}"))
     }
 
     fn tick(&mut self, context: &egui::Context) {
@@ -327,17 +546,85 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn raw_input_hook(&mut self, context: &egui::Context, input: &mut egui::RawInput) {
+        let focused = context.memory(|memory| memory.has_focus(patch_editor_id()));
+        if focused {
+            // Deferred events have already had the text generated by Alt-M removed.
+            let mut suppress_alt_text = false;
+            input.events.retain(|event| {
+                if let egui::Event::Key {
+                    key,
+                    modifiers,
+                    pressed: true,
+                    ..
+                } = event
+                {
+                    suppress_alt_text = *key == egui::Key::M && *modifiers == egui::Modifiers::ALT;
+                } else if matches!(event, egui::Event::Text(_)) && suppress_alt_text {
+                    suppress_alt_text = false;
+                    return false;
+                }
+                true
+            });
+        }
+        self.deferred_events.append(&mut input.events);
+        input.events = std::mem::take(&mut self.deferred_events);
+        if !focused {
+            return;
+        }
+        // Keep custom shortcuts in order with native text edits from the same input batch.
+        if let Some(index) = input.events.iter().position(custom_editor_key) {
+            let end = if index == 0 { 1 } else { index };
+            self.deferred_events = input.events.split_off(end);
+            if !self.deferred_events.is_empty() {
+                context.request_repaint();
+            }
+        }
+        let mut events = Vec::with_capacity(input.events.len());
+        for event in std::mem::take(&mut input.events) {
+            if let egui::Event::Key {
+                key,
+                modifiers,
+                pressed: true,
+                ..
+            } = &event
+                && cfg!(target_os = "macos")
+                && modifiers.ctrl
+                && !modifiers.alt
+                && !modifiers.mac_cmd
+                && !modifiers.shift
+            {
+                match key {
+                    egui::Key::C => {
+                        events.push(egui::Event::Copy);
+                        continue;
+                    }
+                    egui::Key::X => {
+                        events.push(egui::Event::Cut);
+                        continue;
+                    }
+                    egui::Key::V => {
+                        match self.clipboard_text() {
+                            Ok(text) => events.push(egui::Event::Paste(text)),
+                            Err(error) => self.notice = Some(format!("ERROR: {error}")),
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            events.push(event);
+        }
+        input.events = events;
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         if context.input(|input| input.viewport().close_requested()) && self.modified() {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(Pending::Close);
         }
-        let save =
-            context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::S));
-        if save && let Err(error) = self.save_file() {
-            self.notice = Some(format!("ERROR: {error}"));
-        }
+        self.shortcuts(&context);
         ui.horizontal(|ui| {
             ui.heading("ANSIedad GUI");
             if ui
@@ -366,11 +653,7 @@ impl eframe::App for App {
             ui.text_edit_singleline(&mut self.path_input);
             if ui.button("Open / reload").clicked() {
                 let path = PathBuf::from(self.path_input.trim());
-                if self.modified() {
-                    self.pending = Some(Pending::Open(path));
-                } else if let Err(error) = self.open_file(path) {
-                    self.notice = Some(format!("ERROR: {error}"));
-                }
+                self.request_open(path);
             }
             if ui.button("Save").clicked()
                 && let Err(error) = self.save_file()
@@ -419,14 +702,7 @@ impl eframe::App for App {
             egui::ScrollArea::both()
                 .max_height(height)
                 .show(&mut columns[0], |ui| {
-                    changed = ui
-                        .add(
-                            egui::TextEdit::multiline(&mut self.source)
-                                .code_editor()
-                                .desired_width(f32::INFINITY)
-                                .desired_rows(30),
-                        )
-                        .changed();
+                    changed = self.patch_editor(ui);
                 });
             if changed {
                 self.preview();
@@ -517,6 +793,345 @@ mod tests {
             None,
             Arc::new(Mutex::new(None)),
         )
+    }
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn editor_frame(
+        app: &mut App,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        eframe::App::raw_input_hook(app, context, &mut input);
+        let mut output = context.run_ui(input, |ui| {
+            app.shortcuts(ui.ctx());
+            if app.patch_editor(ui) {
+                app.preview();
+            }
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn select(context: &egui::Context, anchor: usize, cursor: usize) {
+        let mut state = egui::TextEdit::load_state(context, patch_editor_id()).unwrap();
+        state.cursor.set_char_range(Some(CCursorRange::two(
+            CCursor::new(anchor),
+            CCursor::new(cursor),
+        )));
+        state.store(context, patch_editor_id());
+    }
+
+    fn selected(app: &App, context: &egui::Context) -> String {
+        egui::TextEdit::load_state(context, patch_editor_id())
+            .unwrap()
+            .cursor
+            .char_range()
+            .unwrap()
+            .slice_str(&app.source)
+            .to_owned()
+    }
+
+    #[test]
+    fn editor_selection_supports_shift_and_control_shift_navigation() {
+        let context = egui::Context::default();
+        let mut app = app("TEXT='alpha 世界'; c='TEXT[0]'\n\n# last");
+        editor_frame(&mut app, &context, vec![]);
+        select(&context, 0, 0);
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::ArrowRight, egui::Modifiers::SHIFT)],
+        );
+        assert_eq!(selected(&app, &context), "T");
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(
+                egui::Key::ArrowRight,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(selected(&app, &context), "TEXT");
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(
+                egui::Key::ArrowDown,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(
+            selected(&app, &context),
+            "TEXT='alpha 世界'; c='TEXT[0]'\n\n"
+        );
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(
+                egui::Key::End,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(selected(&app, &context), app.source);
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(
+                egui::Key::Home,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(selected(&app, &context), "");
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::End, egui::Modifiers::CTRL)],
+        );
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(
+                egui::Key::ArrowUp,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(selected(&app, &context), "# last");
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::ArrowRight, egui::Modifiers::CTRL)],
+        );
+        assert_eq!(selected(&app, &context), "");
+    }
+
+    #[test]
+    fn comment_shortcut_preserves_unicode_selection_and_supports_native_undo_redo() {
+        let context = egui::Context::default();
+        let source = "  c=\"'é'\"\n\n  # existing\nf='2'";
+        let mut app = app(source);
+        editor_frame(&mut app, &context, vec![]);
+        let end = Position { row: 3, col: 0 }.index(source);
+        select(&context, end, 0);
+        editor_frame(
+            &mut app,
+            &context,
+            vec![
+                key_event(egui::Key::M, egui::Modifiers::ALT),
+                egui::Event::Text("µ".into()),
+            ],
+        );
+        let commented = "  # c=\"'é'\"\n\n  # # existing\nf='2'";
+        assert_eq!(app.source, commented);
+        assert_eq!(
+            selected(&app, &context),
+            "  # c=\"'é'\"\n\n  # # existing\n"
+        );
+        assert!(app.parse_error.is_none());
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::Z, egui::Modifiers::COMMAND)],
+        );
+        assert_eq!(app.source, source);
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(
+                egui::Key::Z,
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(app.source, commented);
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::M, egui::Modifiers::ALT)],
+        );
+        assert_eq!(app.source, source);
+    }
+
+    #[test]
+    fn clipboard_events_copy_cut_and_replace_unicode_selection() {
+        let context = egui::Context::default();
+        let mut app = app("TEXT='é界'; c='TEXT[0]'");
+        editor_frame(&mut app, &context, vec![]);
+        select(&context, 6, 8);
+        let copy = if cfg!(target_os = "macos") {
+            key_event(egui::Key::C, egui::Modifiers::CTRL)
+        } else {
+            egui::Event::Copy
+        };
+        let output = editor_frame(&mut app, &context, vec![copy]);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(command, egui::OutputCommand::CopyText(text) if text == "é界")
+        }));
+        assert_eq!(selected(&app, &context), "é界");
+        let cut = if cfg!(target_os = "macos") {
+            key_event(egui::Key::X, egui::Modifiers::CTRL)
+        } else {
+            egui::Event::Cut
+        };
+        editor_frame(&mut app, &context, vec![cut]);
+        assert_eq!(app.source, "TEXT=''; c='TEXT[0]'");
+        editor_frame(&mut app, &context, vec![egui::Event::Paste("AB".into())]);
+        assert_eq!(app.source, "TEXT='AB'; c='TEXT[0]'");
+        select(&context, 6, 8);
+        editor_frame(&mut app, &context, vec![egui::Event::Paste("Ж".into())]);
+        assert_eq!(app.source, "TEXT='Ж'; c='TEXT[0]'");
+    }
+
+    #[test]
+    fn custom_shortcuts_remain_ordered_with_native_typing_in_one_batch() {
+        let context = egui::Context::default();
+        let mut app = app("c=\"'E'\"");
+        editor_frame(&mut app, &context, vec![]);
+        select(&context, 0, 0);
+        editor_frame(
+            &mut app,
+            &context,
+            vec![
+                egui::Event::Text("X".into()),
+                key_event(egui::Key::M, egui::Modifiers::ALT),
+                egui::Event::Text("µ".into()),
+                egui::Event::Text("Y".into()),
+            ],
+        );
+        assert_eq!(app.source, "Xc=\"'E'\"");
+        editor_frame(&mut app, &context, vec![]);
+        assert_eq!(app.source, "# Xc=\"'E'\"");
+        editor_frame(&mut app, &context, vec![]);
+        assert_eq!(app.source, "# XYc=\"'E'\"");
+    }
+
+    #[test]
+    fn editor_shortcuts_leave_other_text_fields_alone() {
+        let context = egui::Context::default();
+        let mut app = app("b='t'");
+        editor_frame(&mut app, &context, vec![]);
+        let path_id = egui::Id::unique("path-test");
+        context.memory_mut(|memory| memory.request_focus(path_id));
+        let mut input = egui::RawInput {
+            events: vec![
+                key_event(egui::Key::M, egui::Modifiers::ALT),
+                egui::Event::Text("µ".into()),
+            ],
+            ..Default::default()
+        };
+        eframe::App::raw_input_hook(&mut app, &context, &mut input);
+        let mut output = context.run_ui(input, |ui| {
+            egui::TextEdit::singleline(&mut app.path_input)
+                .id(path_id)
+                .show(ui);
+            app.patch_editor(ui);
+        });
+        output.textures_delta.clear();
+        assert_eq!(app.source, "b='t'");
+        assert!(app.path_input.contains('µ'));
+    }
+
+    #[test]
+    fn save_shortcuts_follow_same_batch_edits_and_reload_uses_the_loaded_path() {
+        let path = env::temp_dir().join(format!(
+            "ansiedad-gui-shortcuts-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let context = egui::Context::default();
+        let mut app = app("b='t'");
+        app.path_input = path.to_string_lossy().into_owned();
+        app.save_file().unwrap();
+        editor_frame(&mut app, &context, vec![]);
+        for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::COMMAND] {
+            select(&context, 0, 0);
+            let before = app.source.clone();
+            editor_frame(
+                &mut app,
+                &context,
+                vec![
+                    egui::Event::Text("# ".into()),
+                    key_event(egui::Key::S, modifiers),
+                ],
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), before);
+            editor_frame(&mut app, &context, vec![]);
+            assert_eq!(fs::read_to_string(&path).unwrap(), format!("# {before}"));
+        }
+        fs::write(&path, "f='3'").unwrap();
+        app.path_input = "not-the-loaded-file.txt".into();
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::F5, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.source, "f='3'");
+        assert_eq!(app.path.as_ref(), Some(&path));
+        app.source = "f='4'".into();
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::F5, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.source, "f='4'");
+        assert!(matches!(&app.pending, Some(Pending::Open(pending)) if pending == &path));
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn global_shortcuts_pause_reset_and_confirm_unsaved_quit() {
+        let context = egui::Context::default();
+        let mut app = app("b='t'");
+        editor_frame(&mut app, &context, vec![]);
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::P, egui::Modifiers::CTRL)],
+        );
+        assert!(app.paused);
+        app.t = 123;
+        app.frame = 5;
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::R, egui::Modifiers::CTRL)],
+        );
+        assert_eq!((app.t, app.frame), (0, 0));
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::F5, egui::Modifiers::NONE)],
+        );
+        assert!(app.notice.as_ref().unwrap().contains("No file loaded"));
+        app.source.push_str("\nf='15'");
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::Q, egui::Modifiers::CTRL)],
+        );
+        assert!(matches!(app.pending, Some(Pending::Close)));
+        editor_frame(
+            &mut app,
+            &context,
+            vec![key_event(egui::Key::M, egui::Modifiers::ALT)],
+        );
+        assert!(app.paused);
+        assert_eq!(app.source, "# b='t'\nf='15'");
+        assert!(matches!(app.pending, Some(Pending::Close)));
     }
 
     #[test]
