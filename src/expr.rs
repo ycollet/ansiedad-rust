@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, fmt, sync::Arc};
 pub enum Constant {
     Integer(i64),
     Text(String),
+    Expression(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,7 @@ impl std::error::Error for Error {}
 pub(crate) struct ParseError {
     pub error: Error,
     pub offset: usize,
+    pub binding: Option<String>,
 }
 
 impl ParseError {
@@ -28,10 +30,15 @@ impl ParseError {
         Self {
             error: Error(message.into()),
             offset,
+            binding: None,
         }
     }
 
-    fn display(self, source: &str) -> Error {
+    fn display(self, source: &str, constants: &BTreeMap<String, Constant>) -> Error {
+        let source = match self.binding.as_ref().and_then(|name| constants.get(name)) {
+            Some(Constant::Expression(source)) => source,
+            _ => source,
+        };
         let prefix = &source[..self.offset];
         let line = prefix
             .chars()
@@ -39,7 +46,13 @@ impl ParseError {
             .count()
             + 1;
         let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-        Error(format!("line {line}, column {column}: {}", self.error))
+        let binding = self
+            .binding
+            .map_or(String::new(), |name| format!("{name}: "));
+        Error(format!(
+            "line {line}, column {column}: {binding}{}",
+            self.error
+        ))
     }
 }
 
@@ -139,6 +152,7 @@ pub enum Expr {
     Length(Box<Expr>),
     Unary(Op, Box<Expr>),
     Binary(Op, Box<Expr>, Box<Expr>),
+    Binding(String, Arc<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -186,20 +200,38 @@ enum Token {
 
 impl Expr {
     pub fn parse(source: &str, constants: &BTreeMap<String, Constant>) -> Result<Self, Error> {
-        Self::parse_located(source, constants, false).map_err(|error| error.display(source))
+        Self::parse_located(source, constants, false)
+            .map_err(|error| error.display(source, constants))
     }
 
     pub fn parse_canvas(
         source: &str,
         constants: &BTreeMap<String, Constant>,
     ) -> Result<Self, Error> {
-        Self::parse_located(source, constants, true).map_err(|error| error.display(source))
+        Self::parse_located(source, constants, true)
+            .map_err(|error| error.display(source, constants))
     }
 
     pub(crate) fn parse_located(
         source: &str,
         constants: &BTreeMap<String, Constant>,
         canvas: bool,
+    ) -> Result<Self, ParseError> {
+        Self::parse_bindings(
+            source,
+            constants,
+            canvas,
+            &mut BTreeMap::new(),
+            &mut Vec::new(),
+        )
+    }
+
+    fn parse_bindings(
+        source: &str,
+        constants: &BTreeMap<String, Constant>,
+        canvas: bool,
+        bindings: &mut BTreeMap<String, Arc<Expr>>,
+        resolving: &mut Vec<String>,
     ) -> Result<Self, ParseError> {
         if source.len() > 4096 {
             return Err(ParseError::new(0, "expression exceeds 4096 bytes"));
@@ -210,6 +242,8 @@ impl Expr {
             pos: 0,
             constants,
             canvas,
+            bindings,
+            resolving,
         };
         let expr = parser.expression(0, 0)?;
         if parser.peek() != &Token::End {
@@ -226,25 +260,45 @@ impl Expr {
     }
 
     pub fn eval_context(&self, context: Context) -> Result<i64, Error> {
+        self.eval_cached(context, &mut BTreeMap::new())
+    }
+
+    fn eval_cached<'a>(
+        &'a self,
+        context: Context,
+        bindings: &mut BTreeMap<&'a str, i64>,
+    ) -> Result<i64, Error> {
         match self {
             Self::Number(n) => Ok(*n),
             Self::Time => Ok(context.t),
             Self::X => Ok(context.x),
             Self::Y => Ok(context.y),
             Self::Frame => Ok(context.frame),
+            Self::Binding(name, expression) => {
+                if let Some(value) = bindings.get(name.as_str()) {
+                    return Ok(*value);
+                }
+                let value = expression
+                    .eval_cached(context, bindings)
+                    .map_err(|error| Error(format!("{name}: {error}")))?;
+                bindings.insert(name, value);
+                Ok(value)
+            }
             Self::Text(_) | Self::CharacterAt(_, _) => Err(Error(
                 "expected an integer; use ord(...) to convert a character".into(),
             )),
-            Self::Ord(value) => Ok(i64::from(u32::from(value.eval_character_context(context)?))),
+            Self::Ord(value) => Ok(i64::from(u32::from(
+                value.eval_character_cached(context, bindings)?,
+            ))),
             Self::Length(value) => match value.as_ref() {
                 Self::Text(text) => Ok(text.len() as i64),
                 _ => {
-                    value.eval_character_context(context)?;
+                    value.eval_character_cached(context, bindings)?;
                     Ok(1)
                 }
             },
             Self::Unary(op, value) => {
-                let value = value.eval_context(context)?;
+                let value = value.eval_cached(context, bindings)?;
                 match op {
                     Op::Add => Ok(value),
                     Op::Sub => Ok(value.wrapping_neg()),
@@ -253,8 +307,8 @@ impl Expr {
                 }
             }
             Self::Binary(op, left, right) => {
-                let a = left.eval_context(context)?;
-                let b = right.eval_context(context)?;
+                let a = left.eval_cached(context, bindings)?;
+                let b = right.eval_cached(context, bindings)?;
                 Ok(match op {
                     Op::Add => a.wrapping_add(b),
                     Op::Sub => a.wrapping_sub(b),
@@ -319,6 +373,14 @@ impl Expr {
     }
 
     pub fn eval_character_context(&self, context: Context) -> Result<char, Error> {
+        self.eval_character_cached(context, &mut BTreeMap::new())
+    }
+
+    fn eval_character_cached<'a>(
+        &'a self,
+        context: Context,
+        bindings: &mut BTreeMap<&'a str, i64>,
+    ) -> Result<char, Error> {
         match self {
             Self::Text(text) if text.len() == 1 => Ok(text[0]),
             Self::Text(_) => Err(Error(
@@ -326,7 +388,7 @@ impl Expr {
             )),
             Self::CharacterAt(source, index) => match source.as_ref() {
                 Self::Text(text) => {
-                    let index = index.eval_context(context)?;
+                    let index = index.eval_cached(context, bindings)?;
                     let len = text.len() as i64;
                     let index = if index < 0 { len + index } else { index };
                     usize::try_from(index)
@@ -336,8 +398,8 @@ impl Expr {
                         .ok_or_else(|| Error("string index out of range".into()))
                 }
                 _ => {
-                    let character = source.eval_character_context(context)?;
-                    if matches!(index.eval_context(context)?, 0 | -1) {
+                    let character = source.eval_character_cached(context, bindings)?;
+                    if matches!(index.eval_cached(context, bindings)?, 0 | -1) {
                         Ok(character)
                     } else {
                         Err(Error("string index out of range".into()))
@@ -443,6 +505,8 @@ struct Parser<'a> {
     pos: usize,
     constants: &'a BTreeMap<String, Constant>,
     canvas: bool,
+    bindings: &'a mut BTreeMap<String, Arc<Expr>>,
+    resolving: &'a mut Vec<String>,
 }
 
 impl Parser<'_> {
@@ -474,6 +538,52 @@ impl Parser<'_> {
             Token::Identifier(name) => match self.constants.get(&name) {
                 Some(Constant::Integer(value)) => Expr::Number(*value),
                 Some(Constant::Text(text)) => Expr::Text(text.chars().collect()),
+                Some(Constant::Expression(source)) => {
+                    if self.resolving.contains(&name) {
+                        return Err(ParseError::new(
+                            offset,
+                            format!("circular expression binding: {name}"),
+                        ));
+                    }
+                    if self.resolving.len() >= 64 {
+                        return Err(ParseError::new(
+                            offset,
+                            "expression bindings exceed 64 levels",
+                        ));
+                    }
+                    let expression = if let Some(expression) = self.bindings.get(&name) {
+                        Arc::clone(expression)
+                    } else {
+                        self.resolving.push(name.clone());
+                        let result = Expr::parse_bindings(
+                            source,
+                            self.constants,
+                            self.canvas,
+                            self.bindings,
+                            self.resolving,
+                        )
+                        .and_then(|expression| {
+                            if expression.is_text() {
+                                Err(ParseError::new(
+                                    0,
+                                    "expression binding must evaluate to an integer",
+                                ))
+                            } else {
+                                Ok(expression)
+                            }
+                        });
+                        self.resolving.pop();
+                        let expression = Arc::new(result.map_err(|mut error| {
+                            if error.binding.is_none() {
+                                error.binding = Some(name.clone());
+                            }
+                            error
+                        })?);
+                        self.bindings.insert(name.clone(), Arc::clone(&expression));
+                        expression
+                    };
+                    Expr::Binding(name, expression)
+                }
                 None => return Err(ParseError::new(offset, format!("unknown constant {name}"))),
             },
             Token::Op(op @ (Op::Add | Op::Sub | Op::Not)) => {
@@ -593,6 +703,41 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_bindings_are_evaluated_per_context_without_expanding_the_reference_graph() {
+        let mut constants = BTreeMap::new();
+        constants.insert("v0".into(), Constant::Expression("t".into()));
+        for index in 1..=40 {
+            let previous = index - 1;
+            constants.insert(
+                format!("v{index}"),
+                Constant::Expression(format!("v{previous} + v{previous}")),
+            );
+        }
+        let expression = Expr::parse("v40", &constants).unwrap();
+        assert_eq!(expression.eval(1).unwrap(), 1_i64 << 40);
+        assert_eq!(expression.eval(3).unwrap(), 3_i64 << 40);
+        for index in 41..=65 {
+            constants.insert(
+                format!("v{index}"),
+                Constant::Expression(format!("v{}", index - 1)),
+            );
+        }
+        assert!(
+            Expr::parse("v65", &constants)
+                .unwrap_err()
+                .to_string()
+                .contains("exceed 64 levels")
+        );
+        constants.insert("bad".into(), Constant::Expression("t + 1 + missing".into()));
+        assert!(
+            Expr::parse("bad", &constants)
+                .unwrap_err()
+                .to_string()
+                .contains("column 9: bad: unknown constant missing")
+        );
+    }
 
     fn parse(source: &str) -> Result<Expr, Error> {
         Expr::parse(source, &BTreeMap::new())

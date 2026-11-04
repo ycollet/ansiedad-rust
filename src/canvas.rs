@@ -75,6 +75,7 @@ impl CanvasConfig {
         let renderer = match mode {
             Mode::Characters => Renderer::Characters(Config::from_settings(settings, true)?),
             Mode::Pixels => {
+                settings.validate_bindings(true)?;
                 let rgba = Expr::parse_located(&rgba, &settings.constants, true)
                     .map_err(|error| settings.expression_error("rgba", error))?;
                 if rgba.is_text() {
@@ -215,6 +216,39 @@ mod tests {
             error,
             "line 2, column 9: rgba at t=2: division or modulo by zero (x=0, y=0, frame=3)"
         );
+    }
+
+    #[test]
+    fn named_channel_expressions_follow_each_pixel_and_frame() {
+        let config = CanvasConfig::parse(
+            "mode=1; w=2; l=2\n\
+             rgba='rval<<24 | gval<<16 | bval<<8 | aval'\n\
+             rval = (x + frame) & 255\n\
+             gval = y & 255\n\
+             bval = (rval ^ gval) & 255\n\
+             aval = (t | y) & 255",
+        )
+        .unwrap();
+        for frame in [0, 7] {
+            let CanvasFrame::Pixels { pixels, .. } = config.render(10, frame).unwrap() else {
+                panic!("expected pixels");
+            };
+            let r = frame as u8;
+            assert_eq!(
+                pixels,
+                [
+                    [r, 0, r, 10],
+                    [r + 1, 0, r + 1, 11],
+                    [r, 1, r ^ 1, 13],
+                    [r + 1, 1, (r + 1) ^ 1, 13]
+                ]
+            );
+        }
+        let config = CanvasConfig::parse("mode=0; w=1; l=1; shade=x+y+frame; b='shade'").unwrap();
+        let CanvasFrame::Characters { cells, .. } = config.render(0, 7).unwrap() else {
+            panic!("expected characters");
+        };
+        assert_eq!(cells[0].background, 7);
     }
 
     #[test]

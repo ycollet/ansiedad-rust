@@ -82,6 +82,16 @@ impl Settings {
         Ok(())
     }
 
+    pub(crate) fn validate_bindings(&self, canvas: bool) -> Result<(), String> {
+        for (name, value) in &self.constants {
+            if matches!(value, Constant::Expression(_)) {
+                Expr::parse_located(name, &self.constants, canvas)
+                    .map_err(|error| self.expression_error(name, error))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn at_value(&self, name: &str, message: impl std::fmt::Display) -> String {
         self.locate(name, None, false, message)
     }
@@ -101,6 +111,7 @@ impl Settings {
     }
 
     pub(crate) fn expression_error(&self, name: &str, error: ParseError) -> String {
+        let name = error.binding.as_deref().unwrap_or(name);
         self.at_expression(name, error.offset, format!("{name}: {}", error.error))
     }
 
@@ -271,8 +282,19 @@ impl Settings {
             _ => {
                 let constant = if value.starts_with(['\'', '"']) {
                     Constant::Text(string()?)
+                } else if let Ok(value) = parse_integer(value.trim_end()) {
+                    Constant::Integer(value)
                 } else {
-                    Constant::Integer(integer()?)
+                    let source = value.trim_end();
+                    expression_columns = source
+                        .chars()
+                        .enumerate()
+                        .flat_map(|(index, character)| {
+                            std::iter::repeat_n(value_column + index, character.len_utf8())
+                        })
+                        .chain(std::iter::once(value_column + source.chars().count()))
+                        .collect();
+                    Constant::Expression(source.into())
                 };
                 self.constants.insert(name.into(), constant);
             }
@@ -312,6 +334,7 @@ impl Config {
 
     pub(crate) fn from_settings(settings: Settings, canvas: bool) -> Result<Self, String> {
         settings.validate()?;
+        settings.validate_bindings(canvas)?;
         let parse = |name, source: &str| {
             Expr::parse_located(source, &settings.constants, canvas)
                 .map_err(|error| settings.expression_error(name, error))
@@ -725,6 +748,63 @@ w=0x40; l=0b10000; m=0; s=0.01; fps=60;
     }
 
     #[test]
+    fn expression_bindings_support_forward_references_and_preserve_strings() {
+        let config = Config::parse(
+            "b='shade'; f='letter'; c='TEXT[t%len(TEXT)]'\n\
+             shade = (phase & 15) + 32\n\
+             phase = t >> 1\n\
+             letter = ord(TEXT[t%len(TEXT)])\n\
+             TEXT = 'AB'; signed = +-1",
+        )
+        .unwrap();
+        for t in [0, 1, 6, 9] {
+            let cell = config.cell(t).unwrap();
+            assert_eq!(cell.background, ((t >> 1) & 15) as u8 + 32);
+            assert_eq!(cell.foreground, if t % 2 == 0 { b'A' } else { b'B' });
+            assert_eq!(cell.character, if t % 2 == 0 { 'A' } else { 'B' });
+        }
+        assert!(Config::parse("text='t & 255'; b='text'").is_err());
+    }
+
+    #[test]
+    fn invalid_bindings_report_the_definition_and_runtime_errors_name_the_binding() {
+        for (source, location, message) in [
+            (
+                "b='bad'\nbad = t + missing",
+                "line 2, column 11:",
+                "unknown constant missing",
+            ),
+            (
+                "bad = bad + 1",
+                "line 1, column 7:",
+                "circular expression binding",
+            ),
+            (
+                "first = second\nsecond = first",
+                "line 2, column 10:",
+                "circular expression binding",
+            ),
+            (
+                "bad = TEXT\nTEXT='hello'",
+                "line 1, column 7:",
+                "must evaluate to an integer",
+            ),
+            ("bad = t +", "line 1, column 10:", "expected"),
+        ] {
+            let error = Config::parse(source).err().expect("invalid binding");
+            assert!(error.starts_with(location), "{error}");
+            assert!(error.contains(message), "{error}");
+        }
+        let config = Config::parse("b='bad'\nbad = 1 // (t-2)").unwrap();
+        assert!(
+            config
+                .cell(2)
+                .unwrap_err()
+                .contains("bad: division or modulo by zero")
+        );
+    }
+
+    #[test]
     fn rejects_malformed_assignments_with_line_numbers() {
         for statement in [
             "b",
@@ -741,7 +821,6 @@ w=0x40; l=0b10000; m=0; s=0.01; fps=60;
             "value=0b2",
             "value=0x",
             "value=9223372036854775808",
-            "value=+-1",
             "w='64'",
             "fps=1.5",
             "s='0.1'",

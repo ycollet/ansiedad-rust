@@ -253,7 +253,28 @@ Three other names are reserved inside expressions: `t` is the read-only integer
 cell counter, starting at zero; `ord(...)` returns a single character's integer
 Unicode code point; and `len(...)` returns a string's integer character count.
 None can be assigned in a patch file. Other valid names define custom integer
-or string constants.
+constants, string constants, or integer expression bindings.
+
+### User-defined expressions
+
+Use unquoted expressions to name intermediate calculations. They are evaluated
+with the current `t` (and `x`, `y`, `frame` in the GUI), not frozen at assignment:
+
+```python
+mode = 1
+rval = x & 255
+gval = y & 255
+bval = (x ^ y) & 255
+aval = (x | y) & 255
+rgba = "rval << 24 | gval << 16 | bval << 8 | aval"
+```
+
+Bindings can refer to other bindings defined before or after them. Circular
+references and unknown names are errors. Bindings must produce integers and
+also work in `b`, `f`, and `c` expressions in the console editor. Quoted user
+values remain literal strings: `TEXT = "Hello"` is text, while
+`shade = t & 255` is an expression. Renderer settings such as `w` and `fps`
+still require literal values.
 
 ### More examples
 
