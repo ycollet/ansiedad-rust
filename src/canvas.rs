@@ -54,28 +54,35 @@ impl CanvasConfig {
             None | Some(Constant::Integer(0)) => Mode::Characters,
             Some(Constant::Integer(1)) => Mode::Pixels,
             _ => {
-                return Err(
-                    "mode must be an unquoted integer: 0 (characters) or 1 (pixels)".into(),
-                );
+                return Err(settings.at_value(
+                    "mode",
+                    "mode must be an unquoted integer: 0 (characters) or 1 (pixels)",
+                ));
             }
         };
         let rgba = match settings.constants.remove("rgba") {
             None => "0x000000ff".into(),
             Some(Constant::Text(expression)) => expression,
-            _ => return Err("rgba must be a quoted integer expression".into()),
+            _ => return Err(settings.at_value("rgba", "rgba must be a quoted integer expression")),
         };
         for name in ["x", "y", "frame"] {
             if settings.constants.contains_key(name) {
-                return Err(format!("{name} is read-only in graphical patches"));
+                return Err(
+                    settings.at_name(name, format!("{name} is read-only in graphical patches"))
+                );
             }
         }
         let renderer = match mode {
             Mode::Characters => Renderer::Characters(Config::from_settings(settings, true)?),
             Mode::Pixels => {
-                let rgba = Expr::parse_canvas(&rgba, &settings.constants)
-                    .map_err(|error| format!("rgba: {error}"))?;
+                let rgba = Expr::parse_located(&rgba, &settings.constants, true)
+                    .map_err(|error| settings.expression_error("rgba", error))?;
                 if rgba.is_text() {
-                    return Err("rgba must evaluate to an integer, not a string".into());
+                    return Err(settings.at_expression(
+                        "rgba",
+                        0,
+                        "rgba must evaluate to an integer, not a string",
+                    ));
                 }
                 Renderer::Pixels { settings, rgba }
             }
@@ -131,7 +138,14 @@ impl CanvasConfig {
                         rgba.eval_context(context)
                             .map(|value| (value as u32).to_be_bytes())
                             .map_err(|message| {
-                                error(context, format!("rgba at t={}: {message}", context.t))
+                                error(
+                                    context,
+                                    settings.at_expression(
+                                        "rgba",
+                                        0,
+                                        format!("rgba at t={}: {message}", context.t),
+                                    ),
+                                )
                             })
                     })
                     .collect::<Result<_, _>>()?;
@@ -178,6 +192,30 @@ pub fn ansi_color(index: u8) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphical_diagnostics_locate_settings_expressions_and_runtime_failures() {
+        for (source, location) in [
+            ("# canvas\n mode = 2", "line 2, column 9:"),
+            ("TEXT='é'; x=0", "line 1, column 11:"),
+            ("mode=1\n rgba=\"x + missing\"", "line 2, column 12:"),
+            ("mode=1; rgba=2", "line 1, column 14:"),
+        ] {
+            let error = CanvasConfig::parse(source)
+                .err()
+                .expect("expected an invalid patch");
+            assert!(error.starts_with(location), "{source:?}: {error}");
+        }
+        let config = CanvasConfig::parse("mode=1\n  rgba='1/(t-2)'").unwrap();
+        let error = config
+            .render(2, 3)
+            .err()
+            .expect("expected division by zero");
+        assert_eq!(
+            error,
+            "line 2, column 9: rgba at t=2: division or modulo by zero (x=0, y=0, frame=3)"
+        );
+    }
 
     #[test]
     fn rgba_coordinates_frame_time_and_alpha_are_independent() {

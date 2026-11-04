@@ -101,7 +101,7 @@ fn file_free_startup_and_explicit_config_errors() {
     fs::write(&patch, "b='0'; invalid statement\n").unwrap();
     let output = run(&["--check", "semicolons.txt"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("line 1:"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("line 1, column "));
     fs::remove_file(patch).unwrap();
     fs::remove_file(directory.join("editme.txt")).unwrap();
     fs::remove_dir(directory).unwrap();

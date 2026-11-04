@@ -873,7 +873,12 @@ mod tests {
         };
         let editor_rect = frame(&mut app, vec![]);
         frame(&mut app, vec![egui::Event::Text("\nNEW".into())]);
-        assert!(app.parse_error.is_some());
+        assert!(
+            app.parse_error
+                .as_deref()
+                .unwrap()
+                .starts_with("line 2, column 4:")
+        );
         assert_eq!(frame(&mut app, vec![]), editor_rect);
         app.notice = Some(format!(
             "ERROR: {}",

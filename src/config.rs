@@ -1,9 +1,5 @@
-use crate::expr::{Constant, Context, Expr, parse_integer, parse_string};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
-};
+use crate::expr::{Constant, Context, Expr, ParseError, parse_integer, parse_string_mapped};
+use std::{collections::BTreeMap, fs, path::Path};
 use unicode_width::UnicodeWidthChar;
 
 pub const STARTER: &str = "\
@@ -17,6 +13,18 @@ c = \"144\"
 ";
 
 #[derive(Debug)]
+struct Assignment {
+    line: usize,
+    name_column: usize,
+    value_column: usize,
+    expression_columns: Vec<usize>,
+}
+
+fn diagnostic(line: usize, column: usize, message: impl std::fmt::Display) -> String {
+    format!("line {line}, column {column}: {message}")
+}
+
+#[derive(Debug)]
 pub struct Settings {
     pub b: String,
     pub f: String,
@@ -27,6 +35,7 @@ pub struct Settings {
     pub s: f64,
     pub fps: u16,
     pub constants: BTreeMap<String, Constant>,
+    assignments: BTreeMap<String, Assignment>,
 }
 
 impl Default for Settings {
@@ -41,6 +50,7 @@ impl Default for Settings {
             s: 0.0,
             fps: 30,
             constants: BTreeMap::new(),
+            assignments: BTreeMap::new(),
         }
     }
 }
@@ -48,33 +58,75 @@ impl Default for Settings {
 impl Settings {
     pub(crate) fn parse(source: &str) -> Result<Self, String> {
         let mut settings = Self::default();
-        let mut assigned = BTreeSet::new();
         for (index, line) in source.lines().enumerate() {
-            settings
-                .parse_line(line, &mut assigned)
-                .map_err(|error| format!("line {}: {error}", index + 1))?;
+            settings.parse_line(line, index + 1)?;
         }
         Ok(settings)
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if !(1..=512).contains(&self.w) || !(1..=512).contains(&self.l) {
-            return Err("w and l must be between 1 and 512".into());
+        for (name, value) in [("w", self.w), ("l", self.l)] {
+            if !(1..=512).contains(&value) {
+                return Err(self.at_value(name, "w and l must be between 1 and 512"));
+            }
         }
         if self.m > 1 {
-            return Err("m must be 0 (redraw) or 1 (scroll)".into());
+            return Err(self.at_value("m", "m must be 0 (redraw) or 1 (scroll)"));
         }
         if !self.s.is_finite() || !(0.0..=1.0).contains(&self.s) {
-            return Err("s must be a finite number between 0 and 1 seconds".into());
+            return Err(self.at_value("s", "s must be a finite number between 0 and 1 seconds"));
         }
         if !(1..=240).contains(&self.fps) {
-            return Err("fps must be between 1 and 240".into());
+            return Err(self.at_value("fps", "fps must be between 1 and 240"));
         }
         Ok(())
     }
 
-    fn parse_line(&mut self, line: &str, assigned: &mut BTreeSet<String>) -> Result<(), String> {
+    pub(crate) fn at_value(&self, name: &str, message: impl std::fmt::Display) -> String {
+        self.locate(name, None, false, message)
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn at_name(&self, name: &str, message: impl std::fmt::Display) -> String {
+        self.locate(name, None, true, message)
+    }
+
+    pub(crate) fn at_expression(
+        &self,
+        name: &str,
+        offset: usize,
+        message: impl std::fmt::Display,
+    ) -> String {
+        self.locate(name, Some(offset), false, message)
+    }
+
+    pub(crate) fn expression_error(&self, name: &str, error: ParseError) -> String {
+        self.at_expression(name, error.offset, format!("{name}: {}", error.error))
+    }
+
+    fn locate(
+        &self,
+        name: &str,
+        offset: Option<usize>,
+        at_name: bool,
+        message: impl std::fmt::Display,
+    ) -> String {
+        let Some(assignment) = self.assignments.get(name) else {
+            return message.to_string();
+        };
+        let column = if at_name {
+            assignment.name_column
+        } else if let Some(offset) = offset {
+            assignment.expression_columns[offset]
+        } else {
+            assignment.value_column
+        };
+        diagnostic(assignment.line, column, message)
+    }
+
+    fn parse_line(&mut self, line: &str, line_number: usize) -> Result<(), String> {
         let mut start = 0;
+        let mut column = 1;
         let mut quote = None;
         let mut escaped = false;
         for (pos, character) in line.char_indices() {
@@ -90,49 +142,115 @@ impl Settings {
                 match character {
                     '\'' | '"' => quote = Some(character),
                     ';' => {
-                        self.assign(&line[start..pos], assigned)?;
+                        self.assign(&line[start..pos], line_number, column)?;
+                        column += line[start..pos + 1].chars().count();
                         start = pos + 1;
                     }
-                    '#' => return self.assign(&line[start..pos], assigned),
+                    '#' => {
+                        return self.assign(&line[start..pos], line_number, column);
+                    }
                     _ => {}
                 }
             }
         }
-        if quote.is_some() {
-            return Err("unterminated string literal".into());
-        }
-        self.assign(&line[start..], assigned)
+        self.assign(&line[start..], line_number, column)
     }
 
-    fn assign(&mut self, statement: &str, assigned: &mut BTreeSet<String>) -> Result<(), String> {
-        let statement = statement.trim();
+    fn assign(&mut self, statement: &str, line: usize, column: usize) -> Result<(), String> {
+        let column = column
+            + statement
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .count();
+        let statement = statement.trim_start();
         if statement.is_empty() {
             return Ok(());
         }
-        let (name, value) = statement.split_once('=').ok_or("expected name = value")?;
+        let (name, value) = statement.split_once('=').ok_or_else(|| {
+            diagnostic(
+                line,
+                column + statement.chars().count(),
+                "expected name = value",
+            )
+        })?;
+        let value_column = column
+            + name.chars().count()
+            + 1
+            + value
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .count();
         let name = name.trim();
-        let value = value.trim();
+        let value = value.trim_start();
+        let at_value = |message| diagnostic(line, value_column, message);
         let mut bytes = name.bytes();
         if !matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
             || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
             || matches!(name, "t" | "ord" | "len")
         {
-            return Err(format!("invalid or reserved name {name:?}"));
+            let invalid = name
+                .chars()
+                .enumerate()
+                .find(|(index, character)| {
+                    !(character.is_ascii_alphabetic()
+                        || *character == '_'
+                        || *index > 0 && character.is_ascii_digit())
+                })
+                .map_or(0, |(index, _)| index);
+            return Err(diagnostic(
+                line,
+                column + invalid,
+                format!("invalid or reserved name {name:?}"),
+            ));
         }
-        if !assigned.insert(name.into()) {
-            return Err(format!("duplicate assignment to {name}"));
+        if self.assignments.contains_key(name) {
+            return Err(diagnostic(
+                line,
+                column,
+                format!("duplicate assignment to {name}"),
+            ));
         }
-        let string = || {
+        let mut expression_columns = Vec::new();
+        let mut string = || {
             let mut pos = 0;
-            let text = parse_string(value, &mut pos).map_err(|e| format!("{name}: {e}"))?;
+            let (text, offsets) = parse_string_mapped(value, &mut pos).map_err(|error| {
+                diagnostic(
+                    line,
+                    value_column + value[..error.offset].chars().count(),
+                    format!("{name}: {}", error.error),
+                )
+            })?;
             if !value[pos..].trim().is_empty() {
-                return Err(format!("{name}: unexpected text after string"));
+                let trailing = value[pos..]
+                    .chars()
+                    .take_while(|character| character.is_whitespace())
+                    .count();
+                return Err(diagnostic(
+                    line,
+                    value_column + value[..pos].chars().count() + trailing,
+                    format!("{name}: unexpected text after string"),
+                ));
             }
+            let mut characters = value.char_indices().peekable();
+            let mut column = value_column;
+            expression_columns = offsets
+                .into_iter()
+                .map(|offset| {
+                    while characters.peek().is_some_and(|(byte, _)| *byte < offset) {
+                        characters.next();
+                        column += 1;
+                    }
+                    column
+                })
+                .collect();
             Ok(text)
         };
-        let integer = || parse_integer(value).map_err(|e| format!("{name}: {e}"));
-        let dimension =
-            || u16::try_from(integer()?).map_err(|_| format!("{name}: integer outside 0..65535"));
+        let integer =
+            || parse_integer(value.trim_end()).map_err(|e| at_value(format!("{name}: {e}")));
+        let dimension = || {
+            u16::try_from(integer()?)
+                .map_err(|_| at_value(format!("{name}: integer outside 0..65535")))
+        };
         match name {
             "b" => self.b = string()?,
             "f" => self.f = string()?,
@@ -141,10 +259,15 @@ impl Settings {
             "l" => self.l = dimension()?,
             "fps" => self.fps = dimension()?,
             "m" => {
-                self.m =
-                    u8::try_from(integer()?).map_err(|_| "m must be 0 (redraw) or 1 (scroll)")?;
+                self.m = u8::try_from(integer()?)
+                    .map_err(|_| at_value("m must be 0 (redraw) or 1 (scroll)".into()))?;
             }
-            "s" => self.s = value.parse().map_err(|_| "s must be a number")?,
+            "s" => {
+                self.s = value
+                    .trim_end()
+                    .parse()
+                    .map_err(|_| at_value("s must be a number".into()))?
+            }
             _ => {
                 let constant = if value.starts_with(['\'', '"']) {
                     Constant::Text(string()?)
@@ -154,6 +277,15 @@ impl Settings {
                 self.constants.insert(name.into(), constant);
             }
         }
+        self.assignments.insert(
+            name.into(),
+            Assignment {
+                line,
+                name_column: column,
+                value_column,
+                expression_columns,
+            },
+        );
         Ok(())
     }
 }
@@ -181,27 +313,29 @@ impl Config {
     pub(crate) fn from_settings(settings: Settings, canvas: bool) -> Result<Self, String> {
         settings.validate()?;
         let parse = |name, source: &str| {
-            if canvas {
-                Expr::parse_canvas(source, &settings.constants)
-            } else {
-                Expr::parse(source, &settings.constants)
-            }
-            .map_err(|e| format!("{name}: {e}"))
+            Expr::parse_located(source, &settings.constants, canvas)
+                .map_err(|error| settings.expression_error(name, error))
         };
         let background = parse("b", &settings.b)?;
         let foreground = parse("f", &settings.f)?;
         let character = parse("c", &settings.c)?;
         for (name, expression) in [("b", &background), ("f", &foreground)] {
             if expression.is_text() {
-                return Err(format!(
-                    "{name}: expected an integer expression; use ord(...)"
+                return Err(settings.at_expression(
+                    name,
+                    0,
+                    format!("{name}: expected an integer expression; use ord(...)"),
                 ));
             }
         }
         if let Expr::Text(text) = &character
             && text.len() != 1
         {
-            return Err("c: expected exactly one character; index the string".into());
+            return Err(settings.at_expression(
+                "c",
+                0,
+                "c: expected exactly one character; index the string",
+            ));
         }
         Ok(Self {
             settings,
@@ -221,21 +355,26 @@ impl Config {
     pub fn cell_context(&self, context: Context) -> Result<Cell, String> {
         let t = context.t;
         let eval = |name, expr: &Expr| {
-            expr.eval_context(context)
-                .map_err(|e| format!("{name} at t={t}: {e}"))
+            expr.eval_context(context).map_err(|e| {
+                self.settings
+                    .at_expression(name, 0, format!("{name} at t={t}: {e}"))
+            })
         };
         Ok(Cell {
             background: eval("b", &self.background)?.rem_euclid(256) as u8,
             foreground: eval("f", &self.foreground)?.rem_euclid(256) as u8,
             character: if self.character.is_text() {
-                let character = self
-                    .character
-                    .eval_character_context(context)
-                    .map_err(|error| format!("c at t={t}: {error}"))?;
+                let character =
+                    self.character
+                        .eval_character_context(context)
+                        .map_err(|error| {
+                            self.settings
+                                .at_expression("c", 0, format!("c at t={t}: {error}"))
+                        })?;
                 if character.is_control() || character.width() != Some(1) {
-                    return Err(format!(
+                    return Err(self.settings.at_expression("c", 0, format!(
                         "c at t={t}: direct character must be printable and occupy one terminal column"
-                    ));
+                    )));
                 }
                 character
             } else {
@@ -311,6 +450,63 @@ impl LiveConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_locate_assignments_and_decoded_expressions_in_the_original_patch() {
+        for (source, line, column, message) in [
+            (
+                "# patch\n  b = \"t + missing\"",
+                2,
+                12,
+                "unknown constant missing",
+            ),
+            (
+                "TEXT='é😀'; f=\"missing\"",
+                1,
+                15,
+                "unknown constant missing",
+            ),
+            (
+                r#"b="ord(\"é\") + missing""#,
+                1,
+                17,
+                "unknown constant missing",
+            ),
+            (r#"b="1 +\n missing""#, 1, 10, "unknown constant missing"),
+            ("b='t +'", 1, 7, "expected a number"),
+            ("b='(t+1'", 1, 8, "missing closing parenthesis"),
+            (r#"c="'é'[0)""#, 1, 9, "missing closing ']'"),
+            (r#"b="ord('é') @ 1""#, 1, 13, "unexpected character"),
+            ("# patch\n  bad-name = 1", 2, 6, "invalid or reserved name"),
+            ("w=64; w=20", 1, 7, "duplicate assignment"),
+            ("b='0'; NEW", 1, 11, "expected name = value"),
+            ("  w = 0", 1, 7, "w and l must be between"),
+            ("c='ok' no", 1, 8, "unexpected text after string"),
+            ("c='unterminated  ", 1, 18, "unterminated string literal"),
+            (r#"TEXT="é\q""#, 1, 9, "unsupported string escape"),
+            ("w=  ", 1, 5, "invalid integer"),
+            ("  NEW   ", 1, 9, "expected name = value"),
+        ] {
+            let error = Config::parse(source)
+                .err()
+                .expect("expected an invalid patch");
+            assert!(
+                error.starts_with(&format!("line {line}, column {column}: ")),
+                "{source:?}: {error}"
+            );
+            assert!(error.contains(message), "{source:?}: {error}");
+        }
+        assert!(Config::parse("w=4  ; fps=30  \nb='1'  # trailing whitespace").is_ok());
+    }
+
+    #[test]
+    fn runtime_diagnostics_identify_the_expression_and_keep_time_context() {
+        let config = Config::parse("# patch\n  b='1/(t-2)'").unwrap();
+        assert_eq!(
+            config.cell(2).unwrap_err(),
+            "line 2, column 6: b at t=2: division or modulo by zero"
+        );
+    }
 
     #[test]
     fn reload_keeps_last_good_config_and_recovers_after_errors() {
@@ -555,7 +751,7 @@ w=0x40; l=0b10000; m=0; s=0.01; fps=60;
             let error = Config::parse(&format!("# first line\n{statement}"))
                 .err()
                 .unwrap_or_else(|| panic!("accepted {statement}"));
-            assert!(error.contains("line 2:"), "{statement}: {error}");
+            assert!(error.contains("line 2, column "), "{statement}: {error}");
         }
         let config = Config::parse(
             "c='ord(TEXT)-32'; b='LOW&255'; f='HIGH&255'\n\

@@ -214,6 +214,13 @@ around `b`, `f`, and `c` expressions and string constants; numeric settings and
 integer constants are unquoted. Both quote styles support the escapes `\\`,
 `\'`, `\"`, `\n`, `\r`, and `\t`. Strings cannot span physical lines.
 
+Patch errors include **1-based line and column numbers**, counting Unicode
+characters rather than UTF-8 bytes, for example:
+`line 2, column 12: b: unknown constant missing`.
+Expression syntax errors point into the original quoted text, including escapes.
+Runtime errors identify the start of the affected expression and retain the
+current `t` (plus `x`, `y`, and `frame` in the GUI).
+
 The built-in starter is deliberately simple:
 
 ```python

@@ -17,6 +17,32 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+#[derive(Debug)]
+pub(crate) struct ParseError {
+    pub error: Error,
+    pub offset: usize,
+}
+
+impl ParseError {
+    fn new(offset: usize, message: impl Into<String>) -> Self {
+        Self {
+            error: Error(message.into()),
+            offset,
+        }
+    }
+
+    fn display(self, source: &str) -> Error {
+        let prefix = &source[..self.offset];
+        let line = prefix
+            .chars()
+            .filter(|&character| character == '\n')
+            .count()
+            + 1;
+        let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        Error(format!("line {line}, column {column}: {}", self.error))
+    }
+}
+
 pub fn parse_integer(source: &str) -> Result<i64, Error> {
     let (sign, unsigned) = match source.strip_prefix('-') {
         Some(value) => ("-", value),
@@ -42,38 +68,61 @@ pub fn parse_integer(source: &str) -> Result<i64, Error> {
 }
 
 pub fn parse_string(source: &str, pos: &mut usize) -> Result<String, Error> {
+    parse_string_mapped(source, pos)
+        .map(|(text, _)| text)
+        .map_err(|error| error.error)
+}
+
+pub(crate) fn parse_string_mapped(
+    source: &str,
+    pos: &mut usize,
+) -> Result<(String, Vec<usize>), ParseError> {
     let quote = match source.as_bytes().get(*pos) {
         Some(b'\'') => '\'',
         Some(b'"') => '"',
-        _ => return Err(Error("expected a quoted string".into())),
+        _ => return Err(ParseError::new(*pos, "expected a quoted string")),
     };
     *pos += 1;
     let mut text = String::new();
+    // One source offset per decoded byte, plus the closing quote for end-of-input.
+    let mut offsets = Vec::new();
     loop {
+        let start = *pos;
         let character = source[*pos..]
             .chars()
             .next()
-            .ok_or_else(|| Error("unterminated string literal".into()))?;
+            .ok_or_else(|| ParseError::new(*pos, "unterminated string literal"))?;
         *pos += character.len_utf8();
-        match character {
-            character if character == quote => return Ok(text),
-            '\n' | '\r' => return Err(Error("unterminated string literal".into())),
+        let decoded = match character {
+            character if character == quote => {
+                offsets.push(start);
+                return Ok((text, offsets));
+            }
+            '\n' | '\r' => return Err(ParseError::new(start, "unterminated string literal")),
             '\\' => {
+                let escaped_start = *pos;
                 let escaped = source[*pos..]
                     .chars()
                     .next()
-                    .ok_or_else(|| Error("unterminated string escape".into()))?;
+                    .ok_or_else(|| ParseError::new(*pos, "unterminated string escape"))?;
                 *pos += escaped.len_utf8();
-                text.push(match escaped {
+                match escaped {
                     '\\' | '\'' | '"' => escaped,
                     'n' => '\n',
                     'r' => '\r',
                     't' => '\t',
-                    _ => return Err(Error(format!("unsupported string escape \\{escaped}"))),
-                });
+                    _ => {
+                        return Err(ParseError::new(
+                            escaped_start,
+                            format!("unsupported string escape \\{escaped}"),
+                        ));
+                    }
+                }
             }
-            _ => text.push(character),
-        }
+            _ => character,
+        };
+        text.push(decoded);
+        offsets.extend(std::iter::repeat_n(start, decoded.len_utf8()));
     }
 }
 
@@ -137,23 +186,23 @@ enum Token {
 
 impl Expr {
     pub fn parse(source: &str, constants: &BTreeMap<String, Constant>) -> Result<Self, Error> {
-        Self::parse_internal(source, constants, false)
+        Self::parse_located(source, constants, false).map_err(|error| error.display(source))
     }
 
     pub fn parse_canvas(
         source: &str,
         constants: &BTreeMap<String, Constant>,
     ) -> Result<Self, Error> {
-        Self::parse_internal(source, constants, true)
+        Self::parse_located(source, constants, true).map_err(|error| error.display(source))
     }
 
-    fn parse_internal(
+    pub(crate) fn parse_located(
         source: &str,
         constants: &BTreeMap<String, Constant>,
         canvas: bool,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self, ParseError> {
         if source.len() > 4096 {
-            return Err(Error("expression exceeds 4096 bytes".into()));
+            return Err(ParseError::new(0, "expression exceeds 4096 bytes"));
         }
         let tokens = tokenize(source)?;
         let mut parser = Parser {
@@ -164,7 +213,7 @@ impl Expr {
         };
         let expr = parser.expression(0, 0)?;
         if parser.peek() != &Token::End {
-            return Err(Error(format!("unexpected token {:?}", parser.peek())));
+            return Err(parser.error(format!("unexpected token {:?}", parser.peek())));
         }
         Ok(expr)
     }
@@ -300,7 +349,7 @@ impl Expr {
     }
 }
 
-fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
+fn tokenize(source: &str) -> Result<Vec<(Token, usize)>, ParseError> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
     let mut pos = 0;
@@ -310,6 +359,7 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
             pos += 1;
             continue;
         }
+        let start = pos;
         if byte.is_ascii_digit() {
             let start = pos;
             let radix = if byte == b'0' && pos + 1 < bytes.len() {
@@ -329,8 +379,8 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                 pos += 1;
             }
             let value = parse_integer(&source[start..pos])
-                .map_err(|e| Error(format!("{e} at byte {start}")))?;
-            tokens.push(Token::Number(value));
+                .map_err(|error| ParseError::new(start, error.to_string()))?;
+            tokens.push((Token::Number(value), start));
             continue;
         }
         if byte.is_ascii_alphabetic() || byte == b'_' {
@@ -339,11 +389,11 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
             while pos < bytes.len() && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_') {
                 pos += 1;
             }
-            tokens.push(Token::Identifier(source[start..pos].into()));
+            tokens.push((Token::Identifier(source[start..pos].into()), start));
             continue;
         }
         if byte == b'\'' || byte == b'"' {
-            tokens.push(Token::Text(parse_string(source, &mut pos)?));
+            tokens.push((Token::Text(parse_string_mapped(source, &mut pos)?.0), start));
             continue;
         }
         let pair = bytes.get(pos..pos + 2);
@@ -359,11 +409,11 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
             _ => None,
         };
         if let Some(op) = paired_op {
-            tokens.push(Token::Op(op));
+            tokens.push((Token::Op(op), start));
             pos += 2;
             continue;
         }
-        tokens.push(match byte {
+        let token = match byte {
             b'(' => Token::Open,
             b')' => Token::Close,
             b'[' => Token::OpenIndex,
@@ -379,16 +429,17 @@ fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
             b'~' => Token::Op(Op::Not),
             b'<' => Token::Op(Op::Lt),
             b'>' => Token::Op(Op::Gt),
-            _ => return Err(Error(format!("unexpected character at byte {pos}"))),
-        });
+            _ => return Err(ParseError::new(pos, "unexpected character")),
+        };
+        tokens.push((token, start));
         pos += 1;
     }
-    tokens.push(Token::End);
+    tokens.push((Token::End, source.len()));
     Ok(tokens)
 }
 
 struct Parser<'a> {
-    tokens: Vec<Token>,
+    tokens: Vec<(Token, usize)>,
     pos: usize,
     constants: &'a BTreeMap<String, Constant>,
     canvas: bool,
@@ -396,13 +447,18 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn peek(&self) -> &Token {
-        &self.tokens[self.pos]
+        &self.tokens[self.pos].0
     }
 
-    fn expression(&mut self, min: u8, depth: usize) -> Result<Expr, Error> {
+    fn error(&self, message: impl Into<String>) -> ParseError {
+        ParseError::new(self.tokens[self.pos].1, message)
+    }
+
+    fn expression(&mut self, min: u8, depth: usize) -> Result<Expr, ParseError> {
         if depth > 64 {
-            return Err(Error("expression nesting exceeds 64 levels".into()));
+            return Err(self.error("expression nesting exceeds 64 levels"));
         }
+        let offset = self.tokens[self.pos].1;
         let token = self.peek().clone();
         self.pos += 1;
         let mut left = match token {
@@ -418,13 +474,14 @@ impl Parser<'_> {
             Token::Identifier(name) => match self.constants.get(&name) {
                 Some(Constant::Integer(value)) => Expr::Number(*value),
                 Some(Constant::Text(text)) => Expr::Text(text.chars().collect()),
-                None => return Err(Error(format!("unknown constant {name}"))),
+                None => return Err(ParseError::new(offset, format!("unknown constant {name}"))),
             },
             Token::Op(op @ (Op::Add | Op::Sub | Op::Not)) => {
                 let value = self.expression(8, depth + 1)?;
                 if value.is_text() {
-                    return Err(Error(
-                        "unary operators require an integer; use ord(...)".into(),
+                    return Err(ParseError::new(
+                        offset,
+                        "unary operators require an integer; use ord(...)",
                     ));
                 }
                 Expr::Unary(op, Box::new(value))
@@ -432,29 +489,31 @@ impl Parser<'_> {
             Token::Open => {
                 let inner = self.expression(0, depth + 1)?;
                 if self.peek() != &Token::Close {
-                    return Err(Error("missing closing parenthesis".into()));
+                    return Err(self.error("missing closing parenthesis"));
                 }
                 self.pos += 1;
                 inner
             }
             _ => {
-                return Err(Error(
-                    "expected a number, string, name, or parenthesized expression".into(),
+                return Err(ParseError::new(
+                    offset,
+                    "expected a number, string, name, or parenthesized expression",
                 ));
             }
         };
         loop {
             if self.peek() == &Token::OpenIndex {
+                let offset = self.tokens[self.pos].1;
                 if !left.is_text() {
-                    return Err(Error("indexing requires a string".into()));
+                    return Err(self.error("indexing requires a string"));
                 }
                 self.pos += 1;
                 let index = self.expression(0, depth + 1)?;
                 if index.is_text() {
-                    return Err(Error("string index must be an integer".into()));
+                    return Err(ParseError::new(offset, "string index must be an integer"));
                 }
                 if self.peek() != &Token::CloseIndex {
-                    return Err(Error("missing closing ']' in string index".into()));
+                    return Err(self.error("missing closing ']' in string index"));
                 }
                 self.pos += 1;
                 left = Expr::CharacterAt(Box::new(left), Box::new(index));
@@ -478,6 +537,7 @@ impl Parser<'_> {
             if precedence < min {
                 break;
             }
+            let offset = self.tokens[self.pos].1;
             self.pos += 1;
             let next_min = if op == Op::Pow {
                 precedence
@@ -486,8 +546,9 @@ impl Parser<'_> {
             };
             let right = self.expression(next_min, depth + 1)?;
             if left.is_text() || right.is_text() {
-                return Err(Error(
-                    "binary operators require integers; use ord(...)".into(),
+                return Err(ParseError::new(
+                    offset,
+                    "binary operators require integers; use ord(...)",
                 ));
             }
             left = Expr::Binary(op, Box::new(left), Box::new(right));
@@ -495,27 +556,30 @@ impl Parser<'_> {
         Ok(left)
     }
 
-    fn function(&mut self, name: &str, depth: usize) -> Result<Expr, Error> {
+    fn function(&mut self, name: &str, depth: usize) -> Result<Expr, ParseError> {
         if self.peek() != &Token::Open {
-            return Err(Error(format!("expected '(' after {name}")));
+            return Err(self.error(format!("expected '(' after {name}")));
         }
         self.pos += 1;
+        let offset = self.tokens[self.pos].1;
         let value = self.expression(0, depth)?;
         if !value.is_text() {
-            return Err(Error(format!("{name} requires a string or character")));
+            return Err(ParseError::new(
+                offset,
+                format!("{name} requires a string or character"),
+            ));
         }
         if name == "ord"
             && let Expr::Text(text) = &value
             && text.len() != 1
         {
-            return Err(Error(
-                "ord requires exactly one character; index the string".into(),
+            return Err(ParseError::new(
+                offset,
+                "ord requires exactly one character; index the string",
             ));
         }
         if self.peek() != &Token::Close {
-            return Err(Error(format!(
-                "missing closing parenthesis after {name} argument"
-            )));
+            return Err(self.error(format!("missing closing parenthesis after {name} argument")));
         }
         self.pos += 1;
         Ok(if name == "ord" {
@@ -536,6 +600,20 @@ mod tests {
 
     fn eval(source: &str, t: i64) -> i64 {
         parse(source).unwrap().eval(t).unwrap()
+    }
+
+    #[test]
+    fn standalone_expression_errors_count_unicode_characters_and_lines() {
+        for (source, location) in [
+            ("ord('é') + missing", "line 1, column 12:"),
+            ("1 +\n@", "line 2, column 1:"),
+            (r"ord('\q')", "line 1, column 7:"),
+        ] {
+            assert!(
+                parse(source).unwrap_err().to_string().starts_with(location),
+                "{source:?}"
+            );
+        }
     }
 
     #[test]

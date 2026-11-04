@@ -41,7 +41,9 @@ fn graphical_cli_checks_patches_without_a_desktop_and_never_overwrites() {
     fs::write(directory.join("canvas.txt"), "mode=2").unwrap();
     let output = run(&["--check", "canvas.txt"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("mode"));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("line 1, column 6:"));
+    assert!(error.contains("mode"));
     assert!(!run(&["--check", "missing.txt"]).status.success());
     for args in [vec!["--frames", "0"], vec!["--frames"], vec!["--unknown"]] {
         assert!(!run(&args).status.success());
