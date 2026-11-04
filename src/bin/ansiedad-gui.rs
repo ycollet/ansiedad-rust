@@ -619,6 +619,12 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
+}
+
+impl App {
+    fn show(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
         if context.input(|input| input.viewport().close_requested()) && self.modified() {
             context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -683,17 +689,21 @@ impl eframe::App for App {
                 }
             });
         }
-        if let Some(error) = self
+        let error = self
             .notice
             .as_ref()
             .filter(|message| message.starts_with("ERROR:"))
             .or(self.parse_error.as_ref())
-            .or(self.runtime_error.as_ref())
-        {
-            ui.colored_label(Color32::LIGHT_RED, error);
-        } else if let Some(notice) = &self.notice {
-            ui.label(notice);
-        }
+            .or(self.runtime_error.as_ref());
+        let message = error.or(self.notice.as_ref()).map_or("", String::as_str);
+        let text = egui::RichText::new(message);
+        let text = if error.is_some() {
+            text.color(Color32::LIGHT_RED)
+        } else {
+            text
+        };
+        ui.add(egui::Label::new(text).truncate())
+            .on_hover_text(message);
         ui.separator();
         ui.columns(2, |columns| {
             columns[0].label("Patch (edit mode = 0 or mode = 1 to switch renderers)");
@@ -842,6 +852,41 @@ mod tests {
             .unwrap()
             .slice_str(&app.source)
             .to_owned()
+    }
+
+    #[test]
+    fn typing_an_incomplete_assignment_keeps_focus_when_errors_appear_and_clear() {
+        let context = egui::Context::default();
+        let mut app = app("b='t'");
+        app.paused = true;
+        let frame = |app: &mut App, events| {
+            let mut input = egui::RawInput {
+                events,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0))),
+                ..Default::default()
+            };
+            eframe::App::raw_input_hook(app, &context, &mut input);
+            let mut output = context.run_ui(input, |ui| app.show(ui));
+            output.textures_delta.clear();
+            assert!(context.memory(|memory| memory.has_focus(patch_editor_id())));
+            context.read_response(patch_editor_id()).unwrap().rect
+        };
+        let editor_rect = frame(&mut app, vec![]);
+        frame(&mut app, vec![egui::Event::Text("\nNEW".into())]);
+        assert!(app.parse_error.is_some());
+        assert_eq!(frame(&mut app, vec![]), editor_rect);
+        app.notice = Some(format!(
+            "ERROR: {}",
+            "Long diagnostic message. ".repeat(100)
+        ));
+        assert_eq!(frame(&mut app, vec![]), editor_rect);
+        frame(&mut app, vec![egui::Event::Text(" = 2".into())]);
+        assert_eq!(app.source, "b='t'\nNEW = 2");
+        assert!(app.parse_error.is_none());
+        assert_eq!(frame(&mut app, vec![]), editor_rect);
+        frame(&mut app, vec![egui::Event::Text("\nf='15'".into())]);
+        assert_eq!(app.source, "b='t'\nNEW = 2\nf='15'");
+        assert!(app.parse_error.is_none());
     }
 
     #[test]
