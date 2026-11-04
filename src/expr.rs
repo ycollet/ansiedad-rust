@@ -81,7 +81,10 @@ pub fn parse_string(source: &str, pos: &mut usize) -> Result<String, Error> {
 pub enum Expr {
     Number(i64),
     Time,
-    CharacterAt(Arc<[char]>, Box<Expr>),
+    Text(Arc<[char]>),
+    CharacterAt(Box<Expr>, Box<Expr>),
+    Ord(Box<Expr>),
+    Length(Box<Expr>),
     Unary(Op, Box<Expr>),
     Binary(Op, Box<Expr>, Box<Expr>),
 }
@@ -143,16 +146,17 @@ impl Expr {
         match self {
             Self::Number(n) => Ok(*n),
             Self::Time => Ok(t),
-            Self::CharacterAt(text, index) => {
-                let index = index.eval(t)?;
-                let len = text.len() as i64;
-                let index = if index < 0 { len + index } else { index };
-                let character = usize::try_from(index)
-                    .ok()
-                    .and_then(|index| text.get(index))
-                    .ok_or_else(|| Error("string index out of range".into()))?;
-                Ok(i64::from(u32::from(*character)))
-            }
+            Self::Text(_) | Self::CharacterAt(_, _) => Err(Error(
+                "expected an integer; use ord(...) to convert a character".into(),
+            )),
+            Self::Ord(value) => Ok(i64::from(u32::from(value.eval_character(t)?))),
+            Self::Length(value) => match value.as_ref() {
+                Self::Text(text) => Ok(text.len() as i64),
+                _ => {
+                    value.eval_character(t)?;
+                    Ok(1)
+                }
+            },
             Self::Unary(op, value) => {
                 let value = value.eval(t)?;
                 match op {
@@ -214,6 +218,40 @@ impl Expr {
                     Op::Not => unreachable!(),
                 })
             }
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        matches!(self, Self::Text(_) | Self::CharacterAt(_, _))
+    }
+
+    pub fn eval_character(&self, t: i64) -> Result<char, Error> {
+        match self {
+            Self::Text(text) if text.len() == 1 => Ok(text[0]),
+            Self::Text(_) => Err(Error(
+                "expected exactly one character; index the string".into(),
+            )),
+            Self::CharacterAt(source, index) => match source.as_ref() {
+                Self::Text(text) => {
+                    let index = index.eval(t)?;
+                    let len = text.len() as i64;
+                    let index = if index < 0 { len + index } else { index };
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|index| text.get(index))
+                        .copied()
+                        .ok_or_else(|| Error("string index out of range".into()))
+                }
+                _ => {
+                    let character = source.eval_character(t)?;
+                    if matches!(index.eval(t)?, 0 | -1) {
+                        Ok(character)
+                    } else {
+                        Err(Error("string index out of range".into()))
+                    }
+                }
+            },
+            _ => Err(Error("expected a string or character".into())),
         }
     }
 }
@@ -325,16 +363,23 @@ impl Parser<'_> {
         let mut left = match token {
             Token::Number(n) => Expr::Number(n),
             Token::Identifier(name) if name == "t" => Expr::Time,
-            Token::Identifier(name) if name == "ord" => self.ord(depth + 1)?,
+            Token::Text(text) => Expr::Text(text.chars().collect()),
+            Token::Identifier(name) if matches!(name.as_str(), "ord" | "len") => {
+                self.function(&name, depth + 1)?
+            }
             Token::Identifier(name) => match self.constants.get(&name) {
                 Some(Constant::Integer(value)) => Expr::Number(*value),
-                Some(Constant::Text(_)) => {
-                    return Err(Error(format!("string constant {name} requires ord(...)")));
-                }
+                Some(Constant::Text(text)) => Expr::Text(text.chars().collect()),
                 None => return Err(Error(format!("unknown constant {name}"))),
             },
             Token::Op(op @ (Op::Add | Op::Sub | Op::Not)) => {
-                Expr::Unary(op, Box::new(self.expression(8, depth + 1)?))
+                let value = self.expression(8, depth + 1)?;
+                if value.is_text() {
+                    return Err(Error(
+                        "unary operators require an integer; use ord(...)".into(),
+                    ));
+                }
+                Expr::Unary(op, Box::new(value))
             }
             Token::Open => {
                 let inner = self.expression(0, depth + 1)?;
@@ -346,11 +391,30 @@ impl Parser<'_> {
             }
             _ => {
                 return Err(Error(
-                    "expected a number, t, or parenthesized expression".into(),
+                    "expected a number, string, name, or parenthesized expression".into(),
                 ));
             }
         };
-        while let Token::Op(op) = self.peek() {
+        loop {
+            if self.peek() == &Token::OpenIndex {
+                if !left.is_text() {
+                    return Err(Error("indexing requires a string".into()));
+                }
+                self.pos += 1;
+                let index = self.expression(0, depth + 1)?;
+                if index.is_text() {
+                    return Err(Error("string index must be an integer".into()));
+                }
+                if self.peek() != &Token::CloseIndex {
+                    return Err(Error("missing closing ']' in string index".into()));
+                }
+                self.pos += 1;
+                left = Expr::CharacterAt(Box::new(left), Box::new(index));
+                continue;
+            }
+            let Token::Op(op) = self.peek() else {
+                break;
+            };
             let op = *op;
             let precedence = match op {
                 Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge => 1,
@@ -373,52 +437,44 @@ impl Parser<'_> {
                 precedence + 1
             };
             let right = self.expression(next_min, depth + 1)?;
+            if left.is_text() || right.is_text() {
+                return Err(Error(
+                    "binary operators require integers; use ord(...)".into(),
+                ));
+            }
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
-    fn ord(&mut self, depth: usize) -> Result<Expr, Error> {
+    fn function(&mut self, name: &str, depth: usize) -> Result<Expr, Error> {
         if self.peek() != &Token::Open {
-            return Err(Error("expected '(' after ord".into()));
+            return Err(Error(format!("expected '(' after {name}")));
         }
         self.pos += 1;
-        let text = match self.peek() {
-            Token::Text(text) => text.as_str(),
-            Token::Identifier(name) => match self.constants.get(name) {
-                Some(Constant::Text(text)) => text.as_str(),
-                _ => return Err(Error(format!("ord requires a string, not {name}"))),
-            },
-            _ => {
-                return Err(Error(
-                    "ord requires a string literal or string constant".into(),
-                ));
-            }
-        };
-        let text: Arc<[char]> = text.chars().collect();
-        self.pos += 1;
-        let value = if self.peek() == &Token::OpenIndex {
-            self.pos += 1;
-            let index = self.expression(0, depth)?;
-            if self.peek() != &Token::CloseIndex {
-                return Err(Error("missing closing ']' in string index".into()));
-            }
-            self.pos += 1;
-            Expr::CharacterAt(text, Box::new(index))
-        } else if text.len() == 1 {
-            Expr::Number(i64::from(u32::from(text[0])))
-        } else {
+        let value = self.expression(0, depth)?;
+        if !value.is_text() {
+            return Err(Error(format!("{name} requires a string or character")));
+        }
+        if name == "ord"
+            && let Expr::Text(text) = &value
+            && text.len() != 1
+        {
             return Err(Error(
                 "ord requires exactly one character; index the string".into(),
             ));
-        };
+        }
         if self.peek() != &Token::Close {
-            return Err(Error(
-                "missing closing parenthesis after ord argument".into(),
-            ));
+            return Err(Error(format!(
+                "missing closing parenthesis after {name} argument"
+            )));
         }
         self.pos += 1;
-        Ok(value)
+        Ok(if name == "ord" {
+            Expr::Ord(Box::new(value))
+        } else {
+            Expr::Length(Box::new(value))
+        })
     }
 }
 
@@ -471,6 +527,7 @@ mod tests {
         assert_eq!(eval("ord('Aé😀'[t])", -1), 0x1f600);
         assert_eq!(eval("ord('Aé😀'[t])", -3), 65);
         assert_eq!(eval("ord('ab'[ord('0') % 2])", 0), 97);
+        assert_eq!(eval("ord('a'[0][0])", 0), 97);
         for t in [-4, 3] {
             assert!(
                 parse("ord('Aé😀'[t])")
@@ -496,7 +553,6 @@ mod tests {
             "ord('a'[0)",
             "ord('a'[])",
             "ord('a'[0], 1)",
-            "ord('a'[0][0])",
             "ord('a)",
             r"ord('\q')",
             r"ord('a\",
@@ -508,6 +564,66 @@ mod tests {
         }
         let nested = format!("{}0{}", "ord('a'[".repeat(70), "])".repeat(70));
         assert!(parse(&nested).is_err());
+    }
+
+    #[test]
+    fn standalone_string_indexing_returns_a_character_not_an_integer() {
+        let expression = parse("('Aé😀')[t]").unwrap();
+        for (t, expected) in [(0, 'A'), (1, 'é'), (-1, '😀')] {
+            assert_eq!(expression.eval_character(t).unwrap(), expected);
+            assert!(expression.eval(t).is_err());
+        }
+        assert_eq!(
+            parse("'abc'[len('abc')-1]")
+                .unwrap()
+                .eval_character(0)
+                .unwrap(),
+            'c'
+        );
+        assert_eq!(
+            parse("'abc'[1][-1]").unwrap().eval_character(0).unwrap(),
+            'b'
+        );
+        for source in ["'abc'[3]", "'abc'[-4]", "''[0]", "'abc'[0][1]"] {
+            assert!(
+                parse(source)
+                    .unwrap()
+                    .eval_character(0)
+                    .unwrap_err()
+                    .0
+                    .contains("string index out of range"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn len_counts_unicode_characters_in_strings_and_indexed_characters() {
+        assert_eq!(eval("len('')", 0), 0);
+        assert_eq!(eval("len('TEST')", 0), 4);
+        assert_eq!(eval("len('Aé😀')", 0), 3);
+        assert_eq!(eval(r"len('a\nb')", 0), 3);
+        assert_eq!(eval("2*len(('abc'))+1", 0), 7);
+        assert_eq!(eval("len('abc'[t])", 1), 1);
+        assert!(parse("len('abc'[t])").unwrap().eval(3).is_err());
+        for source in [
+            "len",
+            "len()",
+            "len(1)",
+            "len(t)",
+            "len('abc', 1)",
+            "len('abc'",
+            "len(ord('A'))",
+            "ord(len('A'))",
+            "'abc'['A']",
+            "1[0]",
+            "'A'[0] + 1",
+            "-'A'[0]",
+            "len('A')[0]",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+        assert!(parse(&format!("{}'a'{}", "len(".repeat(70), ")".repeat(70))).is_err());
     }
 
     #[test]

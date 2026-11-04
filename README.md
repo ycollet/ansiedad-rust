@@ -144,7 +144,7 @@ the built-in starter above explicitly overrides `b`, `f`, and `c`.
 | --- | --- | --- | --- |
 | `b` | Quoted integer expression | `"0"` | Background color; the result is reduced modulo 256 to an index in `0..255`. |
 | `f` | Quoted integer expression | `"7"` | Foreground color; the result is reduced modulo 256 to an index in `0..255`. |
-| `c` | Quoted integer expression | `"0"` | Character-table index; the result is reduced modulo 224 to an index in `0..223`. |
+| `c` | Quoted integer or character expression | `"0"` | Integers select a character-table index modulo 224; characters such as `test[1]` are displayed directly. |
 | `w` | Unquoted integer | `64` | Grid width in columns, `1..512`; clipped to the available visual pane. |
 | `l` | Unquoted integer | `16` | Grid height in rows, `1..512`; clipped to the available visual pane. |
 | `m` | Unquoted integer | `0` | Rendering mode: `0` redraws the grid; `1` scrolls within the visual pane. |
@@ -154,10 +154,11 @@ the built-in starter above explicitly overrides `b`, `f`, and `c`.
 For example, write `b = "t >> 4"` but `w = 64` and `s = 0.01`.
 Numeric settings take literal values, not expressions such as `w = 32*2`.
 
-Two other names are reserved inside expressions: `t` is the read-only integer
-cell counter, starting at zero, and `ord(...)` is the built-in function that
-returns a single character's integer Unicode code point. Neither can be assigned
-in a patch file. Other valid names define custom integer or string constants.
+Three other names are reserved inside expressions: `t` is the read-only integer
+cell counter, starting at zero; `ord(...)` returns a single character's integer
+Unicode code point; and `len(...)` returns a string's integer character count.
+None can be assigned in a patch file. Other valid names define custom integer
+or string constants.
 
 ### More examples
 
@@ -201,7 +202,7 @@ f = "t&1"; c = "(t%512<64)*(ord(BYE[t%12])-32)"
 Declare integer or string constants directly alongside the settings; no
 `[constants]` section is needed or accepted. Constants may appear before or after
 the expressions that reference them. Names use ASCII letters, digits, and
-underscores, cannot start with a digit, and cannot be `t` or `ord`. Setting names
+underscores, cannot start with a digit, and cannot be `t`, `ord`, or `len`. Setting names
 (`b`, `f`, `c`, `w`, `l`, `m`, `s`, `fps`) are reserved for their settings.
 Names are case-sensitive. Remove leading `#` to enable commented-out examples.
 
@@ -223,17 +224,38 @@ Operator precedence follows Python's arithmetic/bitwise rules; power is
 right-associative. Comparisons produce 0 or 1; use individual comparisons
 instead of Python-style comparison chains.
 
-`ord('A')` returns a character's Unicode code point. String literals or string
-constants can be indexed inside `ord`, as in `ord("abc"[t%3])` or
-`ord(BYE[t%12])`. Indexing counts Unicode characters, supports Python-style
-negative indices, and reports out-of-range indices as evaluation errors.
-Without an index, `ord` requires exactly one character. Expression string
+### Strings and characters
+
+String indexing works outside `ord()`: `test[1]` selects the second character.
+Use it directly in `c` to display that character, without subtracting 32:
+
+```python
+test = "TEST"
+c = "test[t % len(test)]"
+```
+
+`len(test)` returns `4`. It also accepts string literals, empty strings
+(`len('')` is `0`), and indexed characters (`len(test[1])` is `1`).
+Length and indexing count Unicode characters, not UTF-8 bytes or visual columns.
+Indices start at zero, support Python-style negative indices (`test[-1]` is the
+last character), and report out-of-range indices as evaluation errors.
+
+`c` also accepts a single-character string literal or constant, such as
+`c = "'E'"`. Direct characters must be printable and occupy exactly one terminal
+column; control characters, combining marks, and wide characters are rejected
+to preserve the grid layout. Numeric `c` expressions still use the original
+224-character table.
+
+`ord('A')` returns `65`; `ord(test[1])` returns `69` for `"TEST"`.
+Use `ord()` when doing arithmetic with a character or using it in `b` or `f`:
+characters are not implicitly converted to integers. `ord()` requires exactly
+one character. Expression string
 literals accept single or double quotes and the escapes `\\`, `\'`, `\"`,
 `\n`, `\r`, and `\t`; remember to escape them for the outer assignment string too.
 
 Unlike the original's arbitrary Python `eval`, expressions cannot execute
-code, access files, or call functions other than `ord`. Custom values must be
-integer or string constants; strings are only supported as `ord` arguments.
+code, access files, or call functions other than `ord` and `len`. Custom values
+must be integer or string constants; arithmetic operators require integers.
 The assignment format is a limited Python-like syntax, not a Python interpreter.
 Both `/` and `//` perform integer
 floor division, `%` follows Python's signed modulo, and arithmetic wraps at

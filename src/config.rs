@@ -4,6 +4,7 @@ use std::{
     fs,
     path::Path,
 };
+use unicode_width::UnicodeWidthChar;
 
 pub const STARTER: &str = "\
 # Type below for live preview; no file is required.
@@ -98,7 +99,7 @@ impl Settings {
         let mut bytes = name.bytes();
         if !matches!(bytes.next(), Some(b'a'..=b'z' | b'A'..=b'Z' | b'_'))
             || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            || matches!(name, "t" | "ord")
+            || matches!(name, "t" | "ord" | "len")
         {
             return Err(format!("invalid or reserved name {name:?}"));
         }
@@ -176,6 +177,18 @@ impl Config {
         let background = parse("b", &settings.b)?;
         let foreground = parse("f", &settings.f)?;
         let character = parse("c", &settings.c)?;
+        for (name, expression) in [("b", &background), ("f", &foreground)] {
+            if expression.is_text() {
+                return Err(format!(
+                    "{name}: expected an integer expression; use ord(...)"
+                ));
+            }
+        }
+        if let Expr::Text(text) = &character
+            && text.len() != 1
+        {
+            return Err("c: expected exactly one character; index the string".into());
+        }
         Ok(Self {
             settings,
             background,
@@ -189,7 +202,20 @@ impl Config {
         Ok(Cell {
             background: eval("b", &self.background)?.rem_euclid(256) as u8,
             foreground: eval("f", &self.foreground)?.rem_euclid(256) as u8,
-            character: glyph(eval("c", &self.character)?),
+            character: if self.character.is_text() {
+                let character = self
+                    .character
+                    .eval_character(t)
+                    .map_err(|error| format!("c at t={t}: {error}"))?;
+                if character.is_control() || character.width() != Some(1) {
+                    return Err(format!(
+                        "c at t={t}: direct character must be printable and occupy one terminal column"
+                    ));
+                }
+                character
+            } else {
+                glyph(eval("c", &self.character)?)
+            },
         })
     }
 }
@@ -360,6 +386,7 @@ f = "t&1"; c = "(t%512<64)*(ord(BYE[t%12])-32)"
         for source in [
             "t=1",
             "ord=1",
+            "len=1",
             "bad-name=1",
             "=1",
             "value=1.5",
@@ -374,6 +401,78 @@ f = "t&1"; c = "(t%512<64)*(ord(BYE[t%12])-32)"
         let error = config.cell(3).unwrap_err();
         assert!(error.contains("c at t=3"), "{error}");
         assert!(error.contains("string index out of range"), "{error}");
+    }
+
+    #[test]
+    fn direct_characters_and_len_work_without_changing_numeric_ord_behavior() {
+        let config =
+            Config::parse(r#"test="TEST"; b="len(test)"; f="ord(test[1])"; c="test[t%len(test)]""#)
+                .unwrap();
+        for t in 0..8 {
+            assert_eq!(
+                config.cell(t).unwrap(),
+                Cell {
+                    background: 4,
+                    foreground: 69,
+                    character: "TEST".chars().nth((t % 4) as usize).unwrap(),
+                }
+            );
+        }
+        let config = Config::parse(r#"test="éЖ"; c="test[t%len(test)]""#).unwrap();
+        assert_eq!(config.cell(0).unwrap().character, 'é');
+        assert_eq!(config.cell(-1).unwrap().character, 'Ж');
+        assert_eq!(
+            Config::parse(r#"c="'E'""#)
+                .unwrap()
+                .cell(0)
+                .unwrap()
+                .character,
+            'E'
+        );
+        assert_eq!(
+            Config::parse(r#"c="ord('E')-32""#)
+                .unwrap()
+                .cell(0)
+                .unwrap()
+                .character,
+            'E'
+        );
+        let config = Config::parse(r#"test="TEST"; c="test[t]""#).unwrap();
+        assert!(
+            config
+                .cell(4)
+                .unwrap_err()
+                .contains("c at t=4: string index out of range")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_direct_character_types_and_terminal_control_characters() {
+        for source in [
+            r#"b="'A'""#,
+            r#"test="TEST"; f="test[0]""#,
+            r#"test="TEST"; c="test""#,
+            r#"c="''""#,
+            r#"test="TEST"; c="test[0]-32""#,
+        ] {
+            assert!(Config::parse(source).is_err(), "{source}");
+        }
+        for literal in [
+            r#""\n""#,
+            r#""\t""#,
+            "\"\x1b\"",
+            "\"\u{301}\"",
+            "\"界\"",
+            "\"😀\"",
+        ] {
+            let config = Config::parse(&format!("test={literal}; c=\"test[0]\"")).unwrap();
+            let error = config.cell(0).unwrap_err();
+            assert!(error.contains("c at t=0:"), "{error}");
+            assert!(
+                error.contains("printable") && error.contains("one terminal column"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
