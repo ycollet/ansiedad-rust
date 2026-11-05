@@ -1,5 +1,6 @@
 use ansiedad::canvas::{self, CanvasConfig, CanvasFrame, ansi_color};
 use ansiedad::editing::{self, Navigation, Position};
+use ansiedad::video::{self, Recorder, VideoJob};
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, TextureOptions, Vec2};
 use egui::text::{CCursor, CCursorRange};
 use std::{
@@ -19,6 +20,9 @@ Without PATCH, open a built-in pixel animation. The console app is unchanged.
   --check       Validate the patch without opening a window
   --init        Create an example (default: canvas.txt; never overwrite)
   --frames N    Close after N frames
+  --export MP4  Export a video without opening a window (requires FFmpeg)
+  --seconds N   Export duration in seconds (default: 10)
+  --video-fps N Export frame rate, 1..240 (default: patch fps)
   -h, --help    Show help
   -V, --version Show version
 
@@ -38,6 +42,9 @@ struct Args {
     check: bool,
     init: bool,
     frames: Option<u64>,
+    export: Option<PathBuf>,
+    seconds: Option<f64>,
+    video_fps: Option<u16>,
 }
 
 fn args() -> Result<Option<Args>, String> {
@@ -66,10 +73,45 @@ fn args() -> Result<Option<Args>, String> {
                 }
                 result.frames = Some(count);
             }
+            "--export" => {
+                if result.export.is_some() {
+                    return Err("--export can only be supplied once".into());
+                }
+                result.export = Some(args.next().ok_or("--export requires an MP4 path")?.into());
+            }
+            "--seconds" => {
+                let seconds = args
+                    .next()
+                    .ok_or("--seconds requires a positive number")?
+                    .parse::<f64>()
+                    .map_err(|_| "--seconds requires a positive number")?;
+                if !seconds.is_finite() || seconds <= 0.0 {
+                    return Err("--seconds requires a finite positive number".into());
+                }
+                result.seconds = Some(seconds);
+            }
+            "--video-fps" => {
+                let fps = args
+                    .next()
+                    .ok_or("--video-fps requires an integer from 1 to 240")?
+                    .parse::<u16>()
+                    .map_err(|_| "--video-fps requires an integer from 1 to 240")?;
+                if !(1..=240).contains(&fps) {
+                    return Err("--video-fps must be from 1 to 240".into());
+                }
+                result.video_fps = Some(fps);
+            }
             _ if arg.starts_with('-') => return Err(format!("unknown option: {arg}")),
             _ if result.path.is_none() => result.path = Some(arg.into()),
             _ => return Err("only one patch path is accepted".into()),
         }
+    }
+    if result.export.is_some() {
+        if result.init || result.check || result.frames.is_some() {
+            return Err("--export cannot be combined with --init, --check, or --frames".into());
+        }
+    } else if result.seconds.is_some() || result.video_fps.is_some() {
+        return Err("--seconds and --video-fps require --export".into());
     }
     Ok(Some(result))
 }
@@ -177,6 +219,12 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     reset_editor: bool,
     deferred_events: Vec<egui::Event>,
+    video_path: String,
+    video_seconds: f64,
+    video_fps: u16,
+    video_job: Option<VideoJob>,
+    recorder: Option<Recorder>,
+    video_error: Option<String>,
 }
 
 impl App {
@@ -187,6 +235,7 @@ impl App {
         frame_limit: Option<u64>,
         outcome: Arc<Mutex<Option<String>>>,
     ) -> Self {
+        let video_fps = config.settings().fps;
         Self {
             saved: source.clone(),
             source,
@@ -215,6 +264,12 @@ impl App {
             clipboard: None,
             reset_editor: true,
             deferred_events: Vec::new(),
+            video_path: "ansiedad.mp4".into(),
+            video_seconds: 10.0,
+            video_fps,
+            video_job: None,
+            recorder: None,
+            video_error: None,
         }
     }
 
@@ -312,7 +367,10 @@ impl App {
             self.dirty = true;
         }
         if pressed(egui::Modifiers::CTRL, egui::Key::Q) {
-            if self.modified() {
+            if self.video_job.is_some() {
+                self.notice =
+                    Some("ERROR: Stop and save or cancel the video before closing".into());
+            } else if self.modified() {
                 self.pending = Some(Pending::Close);
             } else {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -545,6 +603,120 @@ impl App {
     }
 }
 
+impl App {
+    fn video_controls(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Video export / recording").show(ui, |ui| {
+            ui.add_enabled_ui(self.video_job.is_none() && self.pending.is_none(), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("MP4:");
+                    ui.text_edit_singleline(&mut self.video_path);
+                    ui.label("Seconds:");
+                    ui.add(egui::DragValue::new(&mut self.video_seconds).speed(0.1));
+                    ui.label("FPS:");
+                    ui.add(egui::DragValue::new(&mut self.video_fps).range(1..=240));
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Export from frame 0").clicked() {
+                        match VideoJob::offline(
+                            &self.source,
+                            PathBuf::from(self.video_path.trim()),
+                            self.video_seconds,
+                            self.video_fps,
+                        ) {
+                            Ok(job) => {
+                                self.video_error = None;
+                                self.video_job = Some(job);
+                            }
+                            Err(error) => self.notice = Some(format!("ERROR: {error}")),
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.image.is_some(), egui::Button::new("Start recording"))
+                        .clicked()
+                        && let Some(image) = &self.image
+                    {
+                        match Recorder::start(
+                            PathBuf::from(self.video_path.trim()),
+                            self.video_fps,
+                            image,
+                        ) {
+                            Ok((mut recorder, job)) => match recorder.capture(image) {
+                                Ok(()) => {
+                                    self.video_error = None;
+                                    self.recorder = Some(recorder);
+                                    self.video_job = Some(job);
+                                }
+                                Err(error) => {
+                                    job.cancel();
+                                    self.notice = Some(format!("ERROR: {error}"));
+                                }
+                            },
+                            Err(error) => self.notice = Some(format!("ERROR: {error}")),
+                        }
+                    }
+                    ui.small("Canvas only; FFmpeg required. Existing files are never overwritten.");
+                });
+            });
+        });
+        if let Some(job) = &self.video_job {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{}: {} frames",
+                    if self.recorder.is_some() {
+                        "Recording"
+                    } else {
+                        "Exporting / finalizing"
+                    },
+                    job.frames(),
+                ));
+                if self.recorder.is_some() && ui.button("Stop and save").clicked() {
+                    if let Some(image) = &self.image
+                        && let Some(recorder) = &mut self.recorder
+                        && let Err(error) = recorder.capture(image)
+                    {
+                        self.video_error = Some(error);
+                        job.cancel();
+                    }
+                    self.recorder = None;
+                }
+                if ui.button("Cancel video").clicked() {
+                    job.cancel();
+                    self.recorder = None;
+                }
+            });
+        }
+    }
+
+    fn update_video(&mut self, context: &egui::Context) {
+        if let Some(result) = self.video_job.as_mut().and_then(VideoJob::poll) {
+            self.recorder = None;
+            self.video_job = None;
+            self.notice = Some(match result {
+                Ok(video::Outcome::Saved(path)) => format!("Saved video {}", path.display()),
+                Ok(video::Outcome::Canceled) => self.video_error.take().map_or_else(
+                    || "Video canceled; no output file saved".into(),
+                    |error| format!("ERROR: {error}"),
+                ),
+                Err(error) => format!("ERROR: {error}"),
+            });
+            context.request_repaint();
+        }
+        if let Some(recorder) = &mut self.recorder
+            && let Some(image) = &self.image
+            && let Err(error) = recorder.capture(image)
+        {
+            self.video_error = Some(error);
+            if let Some(job) = &self.video_job {
+                job.cancel();
+            }
+            self.recorder = None;
+        }
+        if self.video_job.is_some() {
+            context.request_repaint_after(Duration::from_secs_f64(1.0 / f64::from(self.video_fps)));
+        }
+    }
+}
+
 impl eframe::App for App {
     fn raw_input_hook(&mut self, context: &egui::Context, input: &mut egui::RawInput) {
         let focused = context.memory(|memory| memory.has_focus(patch_editor_id()));
@@ -626,9 +798,15 @@ impl eframe::App for App {
 impl App {
     fn show(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
-        if context.input(|input| input.viewport().close_requested()) && self.modified() {
-            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(Pending::Close);
+        if context.input(|input| input.viewport().close_requested()) {
+            if self.video_job.is_some() {
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.notice =
+                    Some("ERROR: Stop and save or cancel the video before closing".into());
+            } else if self.modified() {
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.pending = Some(Pending::Close);
+            }
         }
         self.shortcuts(&context);
         ui.horizontal(|ui| {
@@ -667,6 +845,7 @@ impl App {
                 self.notice = Some(format!("ERROR: {error}"));
             }
         });
+        self.video_controls(ui);
         if self.pending.is_some() {
             ui.horizontal(|ui| {
                 ui.colored_label(Color32::YELLOW, "Discard unsaved changes?");
@@ -721,6 +900,7 @@ impl App {
             columns[1].label("Canvas");
             self.draw_canvas(&mut columns[1]);
         });
+        self.update_video(&context);
     }
 }
 
@@ -748,6 +928,16 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
         None => canvas::STARTER.into(),
     };
     let config = CanvasConfig::parse(&source)?;
+    if let Some(path) = args.export {
+        let path = video::export(
+            &source,
+            &path,
+            args.seconds.unwrap_or(10.0),
+            args.video_fps.unwrap_or(config.settings().fps),
+        )?;
+        println!("Saved video {}", path.display());
+        return Ok(());
+    }
     if args.check {
         println!(
             "Graphical patch and expressions are valid ({:?})",
@@ -758,7 +948,12 @@ fn start() -> Result<(), Box<dyn std::error::Error>> {
     let outcome = Arc::new(Mutex::new(None));
     let result = Arc::clone(&outcome);
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 720.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_app_id("ansiedad-gui")
+            .with_inner_size([1100.0, 720.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!(
+                "../../assets/ansiedad.png"
+            ))?),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

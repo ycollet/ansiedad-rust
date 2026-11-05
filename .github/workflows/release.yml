@@ -1,0 +1,229 @@
+name: Release installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      base_version: ${{ steps.version.outputs.base_version }}
+      debian_version: ${{ steps.version.outputs.debian_version }}
+      rpm_release: ${{ steps.version.outputs.rpm_release }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Validate installer version
+        id: version
+        run: python3 scripts/release_metadata.py >> "$GITHUB_OUTPUT"
+      - name: Test release metadata
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  debian:
+    needs: metadata
+    runs-on: ubuntu-24.04
+    container: debian:bookworm
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      DEBIAN_VERSION: ${{ needs.metadata.outputs.debian_version }}
+      BINARY_DIR: target/x86_64-unknown-linux-gnu/release
+    steps:
+      - name: Install build and packaging dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config dpkg-dev desktop-file-utils \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test and build both applications
+        run: |
+          cargo test --locked --all-features --target x86_64-unknown-linux-gnu
+          cargo build --release --locked --all-features --bins --target x86_64-unknown-linux-gnu
+      - name: Build Debian installer
+        run: bash scripts/package-linux.sh deb
+      - name: Verify installation
+        run: |
+          apt-get install -y ./dist/*.deb
+          ansiedad --version
+          ansiedad --check
+          ansiedad-gui --version
+          ansiedad-gui --check /usr/share/doc/ansiedad/examples/pixels.txt
+          ansiedad-gui --check /usr/share/doc/ansiedad/examples/characters.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-debian-x86_64
+          path: dist/*.deb
+          if-no-files-found: error
+
+  fedora:
+    needs: metadata
+    runs-on: ubuntu-24.04
+    container: fedora:43
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      BASE_VERSION: ${{ needs.metadata.outputs.base_version }}
+      RPM_RELEASE: ${{ needs.metadata.outputs.rpm_release }}
+      BINARY_DIR: target/x86_64-unknown-linux-gnu/release
+    steps:
+      - name: Install build and packaging dependencies
+        run: |
+          dnf install -y \
+            ca-certificates curl-minimal git gcc gcc-c++ make pkgconf-pkg-config \
+            rpm-build desktop-file-utils libX11-devel libXcursor-devel libXi-devel \
+            libXrandr-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel mesa-libEGL-devel
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test and build both applications
+        run: |
+          cargo test --locked --all-features --target x86_64-unknown-linux-gnu
+          cargo build --release --locked --all-features --bins --target x86_64-unknown-linux-gnu
+      - name: Build Fedora installer
+        run: bash scripts/package-linux.sh rpm
+      - name: Verify installation
+        run: |
+          dnf install -y ./dist/*.rpm
+          ansiedad --version
+          ansiedad --check
+          ansiedad-gui --version
+          ansiedad-gui --check /usr/share/doc/ansiedad/examples/pixels.txt
+          ansiedad-gui --check /usr/share/doc/ansiedad/examples/characters.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-fedora-x86_64
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  macos:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      BASE_VERSION: ${{ needs.metadata.outputs.base_version }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Test and build both applications
+        run: |
+          cargo test --locked --all-features --target "$TARGET"
+          cargo build --release --locked --all-features --bins --target "$TARGET"
+      - name: Build and verify disk image
+        run: bash scripts/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-macos-${{ matrix.target }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    needs: metadata
+    runs-on: windows-2022
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      BASE_VERSION: ${{ needs.metadata.outputs.base_version }}
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Test both applications
+        run: cargo test --locked --all-features --target x86_64-pc-windows-msvc
+      - name: Build both applications
+        run: cargo build --release --locked --all-features --bins --target x86_64-pc-windows-msvc
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $compiler "/DAppVersion=$env:VERSION" "/DFileVersion=$env:BASE_VERSION" packaging/windows.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed: $LASTEXITCODE" }
+      - name: Verify installation
+        shell: pwsh
+        run: |
+          $installer = Get-Item "dist\*.exe"
+          $destination = Join-Path $env:RUNNER_TEMP "ansiedad-installed"
+          $process = Start-Process $installer.FullName -Wait -PassThru -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/DIR=`"$destination`""
+          )
+          if ($process.ExitCode -ne 0) { throw "Installation failed: $($process.ExitCode)" }
+          foreach ($binary in @("ansiedad", "ansiedad-gui")) {
+            & "$destination\$binary.exe" --version
+            if ($LASTEXITCODE -ne 0) { throw "$binary --version failed" }
+            & "$destination\$binary.exe" --check
+            if ($LASTEXITCODE -ne 0) { throw "$binary --check failed" }
+          }
+          foreach ($patch in @("characters", "pixels")) {
+            & "$destination\ansiedad-gui.exe" --check "$destination\examples\$patch.txt"
+            if ($LASTEXITCODE -ne 0) { throw "GUI example check failed: $patch" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows-x86_64
+          path: dist/*.exe
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [metadata, debian, fedora, macos, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+      PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          merge-multiple: true
+          path: dist
+      - name: Publish installers and checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.deb *.rpm *.dmg *.exe > SHA256SUMS
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "ANSIedad $VERSION" --generate-notes --draft
+          fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            -- *.deb *.rpm *.dmg *.exe SHA256SUMS
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease="$PRERELEASE"

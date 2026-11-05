@@ -27,6 +27,7 @@ pub struct CanvasConfig {
     renderer: Renderer,
 }
 
+#[derive(Clone)]
 pub enum CanvasFrame {
     Characters {
         size: [usize; 2],

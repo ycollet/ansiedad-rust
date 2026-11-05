@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ANSIedad
+Comment=Live-coded bytebeat character and pixel visuals
+Exec=ansiedad-gui
+Icon=ansiedad
+Terminal=false
+Categories=Graphics;

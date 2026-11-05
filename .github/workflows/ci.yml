@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint both applications
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: Test release metadata
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2022]
+        features: ["", gui]
+    runs-on: ${{ matrix.os }}
+    env:
+      FEATURES: ${{ matrix.features }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libegl1-mesa-dev
+      - name: Test
+        run: cargo test --locked --all-targets --features "$FEATURES"
+      - name: Install video encoder for integration tests
+        if: runner.os == 'Linux' && matrix.features == 'gui'
+        run: sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Test MP4 export and recording
+        if: runner.os == 'Linux' && matrix.features == 'gui'
+        run: cargo test --locked --features gui --test gui_cli -- --ignored
+      - name: Build applications
+        run: cargo build --locked --bins --features "$FEATURES"

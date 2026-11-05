@@ -205,6 +205,51 @@ confirmation when the draft is modified. Reloading is manual in the GUI; F5
 reloads the loaded file even if you have edited the Path field.
 `--frames N` closes the window after a finite number of frames.
 
+### Video export and live recording
+
+Install **FFmpeg with the `libx264` encoder** and put `ffmpeg` on `PATH`
+(for example, `brew install ffmpeg` on macOS or `sudo apt install ffmpeg` on
+Debian/Ubuntu). It is a runtime dependency only: neither building nor normal
+playback requires FFmpeg, and release installers do not bundle it.
+
+Expand **Video export / recording** in the GUI, enter a new `.mp4` path,
+duration, and frame rate, then choose:
+
+- **Export from frame 0**: render a snapshot of the current draft offline,
+  starting at `t = 0`, `frame = 0`. Edits and playback controls do not affect
+  this export. Invalid patches or evaluation errors stop the export.
+- **Start recording**, then **Stop and save**: record the current canvas in
+  real time, including live edits, pause/resume, and time resets. Paused frames
+  repeat; an invalid draft or evaluation error retains the last valid image,
+  just as in the preview. Changing the canvas dimensions cancels recording.
+
+Both operations run in a background worker with a frame counter and a cancel
+button. Stop/save or cancel the video before closing the application. If a
+recording's bounded encoding queue fills, recording is canceled with an error
+instead of silently dropping frames. Existing files are never overwritten;
+failed or canceled exports remove their temporary files.
+
+For deterministic **headless export**, without a window or desktop session:
+
+```sh
+cargo run --release --features gui --bin ansiedad-gui -- \
+  --export animation.mp4 --seconds 10 --video-fps 30 examples/pixels.txt
+ansiedad-gui --export characters.mp4 --seconds 5 examples/characters.txt
+```
+
+Omit the patch path to export the built-in animation. Duration defaults to
+10 seconds and the export frame rate defaults to the patch's `fps` (1..240).
+Offline export produces `ceil(seconds * fps)` frames, advancing `frame` once
+and `t` by `w * l` per output frame; it does not wait for the patch's `s` delay.
+`--seconds` and `--video-fps` require `--export`, which cannot be combined with
+`--check`, `--init`, or `--frames`.
+
+Videos contain only the canvas, without editor controls or audio. Pixel mode
+uses the native `w` by `l` resolution; character mode uses 8 by 16 pixel cells
+and the GUI's bundled monospace fonts. Transparent pixels composite onto black
+(the preview checkerboard is not recorded). Odd output dimensions are padded
+with black to even dimensions for H.264/YUV420 compatibility.
+
 ## Live expressions
 
 Patch files contain `name = value` assignments separated by newlines or `;`.
@@ -385,6 +430,14 @@ and final square. Character 0 is a space, 144 is light shade, and 187 is a
 solid block. For color-only visuals set `c = "0"` and animate `b`.
 
 ## Development
+
+GitHub Actions checks both applications on Linux, macOS, and Windows and builds
+native release installers. See the [CI and release procedure](.github/README.md)
+for manual builds and publishing version-tagged releases.
+
+The application icon source is `assets/ansiedad.svg`. After editing it, run
+`bash scripts/generate-icons.sh` on macOS with ImageMagick installed to regenerate
+the checked-in PNG, Windows ICO, and macOS ICNS assets.
 
 ```sh
 cargo test
