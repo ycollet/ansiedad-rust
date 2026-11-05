@@ -1,7 +1,10 @@
-use ansiedad::canvas::{self, CanvasConfig, CanvasFrame, ansi_color};
+#[path = "ansiedad-gui/character_mesh.rs"]
+mod character_mesh;
+
+use ansiedad::canvas::{self, CanvasConfig, CanvasFrame};
 use ansiedad::editing::{self, Navigation, Position};
 use ansiedad::video::{self, Recorder, VideoJob};
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, TextureOptions, Vec2};
+use eframe::egui::{self, Color32, Pos2, Rect, Sense, TextureOptions, Vec2};
 use egui::text::{CCursor, CCursorRange};
 use std::{
     env, fs,
@@ -203,6 +206,7 @@ struct App {
     config: CanvasConfig,
     image: Option<CanvasFrame>,
     texture: Option<egui::TextureHandle>,
+    character_mesh: character_mesh::CharacterMesh,
     t: i64,
     frame: i64,
     paused: bool,
@@ -248,6 +252,7 @@ impl App {
             config,
             image: None,
             texture: None,
+            character_mesh: Default::default(),
             t: 0,
             frame: 0,
             paused: false,
@@ -481,6 +486,7 @@ impl App {
             match self.config.render(self.t, self.frame) {
                 Ok(image) => {
                     if let CanvasFrame::Pixels { size, pixels } = &image {
+                        self.character_mesh = Default::default();
                         let colors =
                             egui::ColorImage::from_rgba_unmultiplied(*size, pixels.as_flattened());
                         if let Some(texture) = &mut self.texture {
@@ -494,6 +500,7 @@ impl App {
                         }
                     } else {
                         self.texture = None;
+                        self.character_mesh.invalidate();
                     }
                     self.image = Some(image);
                     self.runtime_error = None;
@@ -524,7 +531,7 @@ impl App {
         }
     }
 
-    fn draw_canvas(&self, ui: &mut egui::Ui) {
+    fn draw_canvas(&mut self, ui: &mut egui::Ui) {
         let Some(image) = &self.image else {
             ui.label("The preview will appear here after a valid frame.");
             return;
@@ -576,28 +583,8 @@ impl App {
                 }
             }
             CanvasFrame::Characters { cells, .. } => {
-                let cell = cell * scale;
-                let font = FontId::monospace(14.0 * scale);
-                for (index, value) in cells.iter().enumerate() {
-                    let min = rect.min
-                        + Vec2::new(
-                            (index % width) as f32 * cell.x,
-                            (index / width) as f32 * cell.y,
-                        );
-                    let cell = Rect::from_min_size(min, cell);
-                    let [r, g, b] = ansi_color(value.background);
-                    painter.rect_filled(cell, 0.0, Color32::from_rgb(r, g, b));
-                    if value.character != ' ' {
-                        let [r, g, b] = ansi_color(value.foreground);
-                        painter.text(
-                            cell.center(),
-                            egui::Align2::CENTER_CENTER,
-                            value.character,
-                            font.clone(),
-                            Color32::from_rgb(r, g, b),
-                        );
-                    }
-                }
+                self.character_mesh
+                    .paint(&painter, rect, [width, height], cells);
             }
         }
     }

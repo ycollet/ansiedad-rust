@@ -152,7 +152,51 @@ pub enum Expr {
     Length(Box<Expr>),
     Unary(Op, Box<Expr>),
     Binary(Op, Box<Expr>, Box<Expr>),
-    Binding(String, Arc<Expr>),
+    Binding(String, usize, usize, Arc<Expr>),
+}
+
+pub(crate) struct Compiler<'a> {
+    constants: &'a BTreeMap<String, Constant>,
+    canvas: bool,
+    bindings: BTreeMap<String, (usize, usize, Arc<Expr>)>,
+    resolving: Vec<String>,
+}
+
+impl<'a> Compiler<'a> {
+    pub(crate) fn new(constants: &'a BTreeMap<String, Constant>, canvas: bool) -> Self {
+        Self {
+            constants,
+            canvas,
+            bindings: BTreeMap::new(),
+            resolving: Vec::new(),
+        }
+    }
+
+    pub(crate) fn parse(&mut self, source: &str) -> Result<Expr, ParseError> {
+        Expr::parse_bindings(
+            source,
+            self.constants,
+            self.canvas,
+            &mut self.bindings,
+            &mut self.resolving,
+        )
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Evaluation {
+    values: Vec<(u64, i64)>,
+    generation: u64,
+}
+
+impl Evaluation {
+    pub(crate) fn begin(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.values.fill((0, 0));
+            self.generation = 1;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -217,20 +261,14 @@ impl Expr {
         constants: &BTreeMap<String, Constant>,
         canvas: bool,
     ) -> Result<Self, ParseError> {
-        Self::parse_bindings(
-            source,
-            constants,
-            canvas,
-            &mut BTreeMap::new(),
-            &mut Vec::new(),
-        )
+        Compiler::new(constants, canvas).parse(source)
     }
 
     fn parse_bindings(
         source: &str,
         constants: &BTreeMap<String, Constant>,
         canvas: bool,
-        bindings: &mut BTreeMap<String, Arc<Expr>>,
+        bindings: &mut BTreeMap<String, (usize, usize, Arc<Expr>)>,
         resolving: &mut Vec<String>,
     ) -> Result<Self, ParseError> {
         if source.len() > 4096 {
@@ -260,13 +298,15 @@ impl Expr {
     }
 
     pub fn eval_context(&self, context: Context) -> Result<i64, Error> {
-        self.eval_cached(context, &mut BTreeMap::new())
+        let mut evaluation = Evaluation::default();
+        evaluation.begin();
+        self.eval_cached(context, &mut evaluation)
     }
 
-    fn eval_cached<'a>(
-        &'a self,
+    pub(crate) fn eval_cached(
+        &self,
         context: Context,
-        bindings: &mut BTreeMap<&'a str, i64>,
+        bindings: &mut Evaluation,
     ) -> Result<i64, Error> {
         match self {
             Self::Number(n) => Ok(*n),
@@ -274,14 +314,19 @@ impl Expr {
             Self::X => Ok(context.x),
             Self::Y => Ok(context.y),
             Self::Frame => Ok(context.frame),
-            Self::Binding(name, expression) => {
-                if let Some(value) = bindings.get(name.as_str()) {
-                    return Ok(*value);
+            Self::Binding(name, slot, _, expression) => {
+                if let Some(&(generation, value)) = bindings.values.get(*slot)
+                    && generation == bindings.generation
+                {
+                    return Ok(value);
                 }
                 let value = expression
                     .eval_cached(context, bindings)
                     .map_err(|error| Error(format!("{name}: {error}")))?;
-                bindings.insert(name, value);
+                if bindings.values.len() <= *slot {
+                    bindings.values.resize(slot + 1, (0, 0));
+                }
+                bindings.values[*slot] = (bindings.generation, value);
                 Ok(value)
             }
             Self::Text(_) | Self::CharacterAt(_, _) => Err(Error(
@@ -365,6 +410,17 @@ impl Expr {
         matches!(self, Self::Text(_) | Self::CharacterAt(_, _))
     }
 
+    fn binding_depth(&self) -> usize {
+        match self {
+            Self::Binding(_, _, depth, _) => *depth,
+            Self::Binary(_, left, right) | Self::CharacterAt(left, right) => {
+                left.binding_depth().max(right.binding_depth())
+            }
+            Self::Unary(_, value) | Self::Ord(value) | Self::Length(value) => value.binding_depth(),
+            _ => 0,
+        }
+    }
+
     pub fn eval_character(&self, t: i64) -> Result<char, Error> {
         self.eval_character_context(Context {
             t,
@@ -373,13 +429,15 @@ impl Expr {
     }
 
     pub fn eval_character_context(&self, context: Context) -> Result<char, Error> {
-        self.eval_character_cached(context, &mut BTreeMap::new())
+        let mut evaluation = Evaluation::default();
+        evaluation.begin();
+        self.eval_character_cached(context, &mut evaluation)
     }
 
-    fn eval_character_cached<'a>(
-        &'a self,
+    pub(crate) fn eval_character_cached(
+        &self,
         context: Context,
-        bindings: &mut BTreeMap<&'a str, i64>,
+        bindings: &mut Evaluation,
     ) -> Result<char, Error> {
         match self {
             Self::Text(text) if text.len() == 1 => Ok(text[0]),
@@ -505,7 +563,7 @@ struct Parser<'a> {
     pos: usize,
     constants: &'a BTreeMap<String, Constant>,
     canvas: bool,
-    bindings: &'a mut BTreeMap<String, Arc<Expr>>,
+    bindings: &'a mut BTreeMap<String, (usize, usize, Arc<Expr>)>,
     resolving: &'a mut Vec<String>,
 }
 
@@ -551,38 +609,48 @@ impl Parser<'_> {
                             "expression bindings exceed 64 levels",
                         ));
                     }
-                    let expression = if let Some(expression) = self.bindings.get(&name) {
-                        Arc::clone(expression)
-                    } else {
-                        self.resolving.push(name.clone());
-                        let result = Expr::parse_bindings(
-                            source,
-                            self.constants,
-                            self.canvas,
-                            self.bindings,
-                            self.resolving,
-                        )
-                        .and_then(|expression| {
-                            if expression.is_text() {
-                                Err(ParseError::new(
-                                    0,
-                                    "expression binding must evaluate to an integer",
-                                ))
-                            } else {
-                                Ok(expression)
-                            }
-                        });
-                        self.resolving.pop();
-                        let expression = Arc::new(result.map_err(|mut error| {
-                            if error.binding.is_none() {
-                                error.binding = Some(name.clone());
-                            }
-                            error
-                        })?);
-                        self.bindings.insert(name.clone(), Arc::clone(&expression));
-                        expression
-                    };
-                    Expr::Binding(name, expression)
+                    let (slot, depth, expression) =
+                        if let Some((slot, depth, expression)) = self.bindings.get(&name) {
+                            (*slot, *depth, Arc::clone(expression))
+                        } else {
+                            self.resolving.push(name.clone());
+                            let result = Expr::parse_bindings(
+                                source,
+                                self.constants,
+                                self.canvas,
+                                self.bindings,
+                                self.resolving,
+                            )
+                            .and_then(|expression| {
+                                if expression.is_text() {
+                                    Err(ParseError::new(
+                                        0,
+                                        "expression binding must evaluate to an integer",
+                                    ))
+                                } else {
+                                    Ok(expression)
+                                }
+                            });
+                            self.resolving.pop();
+                            let expression = Arc::new(result.map_err(|mut error| {
+                                if error.binding.is_none() {
+                                    error.binding = Some(name.clone());
+                                }
+                                error
+                            })?);
+                            let slot = self.bindings.len();
+                            let depth = expression.binding_depth() + 1;
+                            self.bindings
+                                .insert(name.clone(), (slot, depth, Arc::clone(&expression)));
+                            (slot, depth, expression)
+                        };
+                    if self.resolving.len() + depth > 64 {
+                        return Err(ParseError::new(
+                            offset,
+                            "expression bindings exceed 64 levels",
+                        ));
+                    }
+                    Expr::Binding(name, slot, depth, expression)
                 }
                 None => return Err(ParseError::new(offset, format!("unknown constant {name}"))),
             },
@@ -703,6 +771,91 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_compilation_preserves_depth_limits_and_context_isolation() {
+        let mut constants = BTreeMap::new();
+        constants.insert("v0".into(), Constant::Expression("t".into()));
+        for index in 1..=64 {
+            constants.insert(
+                format!("v{index}"),
+                Constant::Expression(format!("v{}", index - 1)),
+            );
+        }
+        let mut compiler = Compiler::new(&constants, false);
+        for index in 0..64 {
+            compiler.parse(&format!("v{index}")).unwrap();
+        }
+        assert!(
+            compiler
+                .parse("v64")
+                .unwrap_err()
+                .error
+                .to_string()
+                .contains("exceed 64")
+        );
+        let expression = compiler.parse("v63 + v63").unwrap();
+        let mut evaluation = Evaluation::default();
+        for t in [1, 7, -3] {
+            evaluation.begin();
+            assert_eq!(
+                expression
+                    .eval_cached(
+                        Context {
+                            t,
+                            ..Default::default()
+                        },
+                        &mut evaluation
+                    )
+                    .unwrap(),
+                t * 2
+            );
+        }
+        for value in &mut evaluation.values {
+            value.0 = 1;
+        }
+        evaluation.generation = u64::MAX;
+        evaluation.begin();
+        assert_eq!(
+            expression
+                .eval_cached(
+                    Context {
+                        t: 9,
+                        ..Default::default()
+                    },
+                    &mut evaluation
+                )
+                .unwrap(),
+            18
+        );
+    }
+
+    #[test]
+    fn failed_bindings_are_not_cached_as_successful_values() {
+        let constants = BTreeMap::from([("a".into(), Constant::Expression("10/t".into()))]);
+        let expression = Compiler::new(&constants, false).parse("a+a").unwrap();
+        let mut evaluation = Evaluation::default();
+        evaluation.begin();
+        assert!(
+            expression
+                .eval_cached(Context::default(), &mut evaluation)
+                .is_err()
+        );
+        assert!(evaluation.values.is_empty());
+        evaluation.begin();
+        assert_eq!(
+            expression
+                .eval_cached(
+                    Context {
+                        t: 2,
+                        ..Default::default()
+                    },
+                    &mut evaluation
+                )
+                .unwrap(),
+            10
+        );
+    }
 
     #[test]
     fn shared_bindings_are_evaluated_per_context_without_expanding_the_reference_graph() {

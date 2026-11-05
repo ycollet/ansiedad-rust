@@ -54,6 +54,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-debian-x86_64
       - name: Test and build both applications
         run: |
           cargo test --locked --all-features --target x86_64-unknown-linux-gnu
@@ -88,12 +91,15 @@ jobs:
         run: |
           dnf install -y \
             ca-certificates curl-minimal git gcc gcc-c++ make pkgconf-pkg-config \
-            rpm-build desktop-file-utils libX11-devel libXcursor-devel libXi-devel \
+            tar rpm-build desktop-file-utils libX11-devel libXcursor-devel libXi-devel \
             libXrandr-devel libxkbcommon-devel libxkbcommon-x11-devel wayland-devel mesa-libEGL-devel
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-fedora-x86_64
       - name: Test and build both applications
         run: |
           cargo test --locked --all-features --target x86_64-unknown-linux-gnu
@@ -137,6 +143,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
       - name: Test and build both applications
         run: |
           cargo test --locked --all-features --target "$TARGET"
@@ -163,6 +172,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-x86_64
       - name: Test both applications
         run: cargo test --locked --all-features --target x86_64-pc-windows-msvc
       - name: Build both applications

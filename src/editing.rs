@@ -45,26 +45,35 @@ pub fn navigate(text: &str, mut position: Position, navigation: Navigation) -> P
         Navigation::Start => Position { row: 0, col: 0 },
         Navigation::End => Position::from_index(text, text.chars().count()),
         Navigation::WordLeft | Navigation::WordRight => {
-            let chars: Vec<char> = text.chars().collect();
             let mut index = position.index(text);
+            let byte = text
+                .char_indices()
+                .nth(index)
+                .map_or(text.len(), |(byte, _)| byte);
             if matches!(navigation, Navigation::WordLeft) {
-                while index > 0 && chars[index - 1].is_whitespace() {
+                let mut chars = text[..byte].chars().rev().peekable();
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
                     index -= 1;
                 }
-                if index > 0 {
-                    let class = word_class(chars[index - 1]);
-                    while index > 0 && word_class(chars[index - 1]) == class {
+                if let Some(&character) = chars.peek() {
+                    let class = word_class(character);
+                    while chars.peek().is_some_and(|&c| word_class(c) == class) {
+                        chars.next();
                         index -= 1;
                     }
                 }
             } else {
-                if let Some(character) = chars.get(index) {
-                    let class = word_class(*character);
-                    while index < chars.len() && word_class(chars[index]) == class {
+                let mut chars = text[byte..].chars().peekable();
+                if let Some(&character) = chars.peek() {
+                    let class = word_class(character);
+                    while chars.peek().is_some_and(|&c| word_class(c) == class) {
+                        chars.next();
                         index += 1;
                     }
                 }
-                while index < chars.len() && chars[index].is_whitespace() {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
                     index += 1;
                 }
             }

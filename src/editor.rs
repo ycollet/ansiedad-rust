@@ -54,7 +54,20 @@ impl Editor {
     }
 
     pub fn modified(&self) -> bool {
-        self.source() != self.saved
+        let mut saved = self.saved.as_str();
+        for (index, line) in self.lines.iter().enumerate() {
+            if index != 0 {
+                let Some(rest) = saved.strip_prefix('\n') else {
+                    return true;
+                };
+                saved = rest;
+            }
+            let Some(rest) = saved.strip_prefix(line.as_str()) else {
+                return true;
+            };
+            saved = rest;
+        }
+        !saved.is_empty()
     }
 
     pub fn position(&self) -> (usize, usize) {
@@ -146,10 +159,12 @@ impl Editor {
         let first = parts.next().unwrap();
         self.lines[self.row].push_str(first);
         self.col += first.chars().count();
-        for part in parts {
-            self.row += 1;
-            self.lines.insert(self.row, part.into());
-            self.col = part.chars().count();
+        let added: Vec<String> = parts.map(String::from).collect();
+        if !added.is_empty() {
+            let count = added.len();
+            self.lines.splice(self.row + 1..self.row + 1, added);
+            self.row += count;
+            self.col = self.lines[self.row].chars().count();
         }
         self.lines[self.row].push_str(&tail);
     }
@@ -456,11 +471,32 @@ impl Editor {
             }
         }
         if focused {
-            let x = gutter + cursor_x - self.left;
-            let row = y + (self.row - self.top) as u16;
-            queue!(out, MoveTo(x as u16, row), Show)?;
+            self.draw_cursor(out, y, width)?;
         }
         Ok(())
+    }
+
+    pub fn draw_cursor(&self, out: &mut impl Write, y: u16, width: u16) -> io::Result<()> {
+        let number_width = self.lines.len().to_string().len() + 2;
+        let gutter = if usize::from(width) > number_width {
+            number_width
+        } else {
+            0
+        };
+        let cursor_x: usize = self.lines[self.row]
+            .chars()
+            .take(self.col)
+            .map(char_width)
+            .sum();
+        queue!(
+            out,
+            ResetColor,
+            MoveTo(
+                (gutter + cursor_x - self.left) as u16,
+                y + (self.row - self.top) as u16
+            ),
+            Show
+        )
     }
 }
 
@@ -499,6 +535,21 @@ pub fn window(text: &str, left: usize, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_multiline_paste_preserves_the_suffix_cursor_and_modified_state() {
+        let mut editor = Editor::new("first\nsuffix\nlast\n");
+        editor.row = 1;
+        editor.col = 0;
+        editor.insert("α\nβ\n");
+        assert_eq!(editor.source(), "first\nα\nβ\nsuffix\nlast\n");
+        assert_eq!(editor.position(), (4, 1));
+        assert!(editor.modified());
+        editor.anchor = Some(Position { row: 1, col: 0 });
+        editor.delete_selection();
+        assert_eq!(editor.source(), "first\nsuffix\nlast\n");
+        assert!(!editor.modified());
+    }
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

@@ -1,4 +1,6 @@
-use crate::expr::{Constant, Context, Expr, ParseError, parse_integer, parse_string_mapped};
+use crate::expr::{
+    Compiler, Constant, Context, Evaluation, Expr, ParseError, parse_integer, parse_string_mapped,
+};
 use std::{collections::BTreeMap, fs, path::Path};
 use unicode_width::UnicodeWidthChar;
 
@@ -82,10 +84,11 @@ impl Settings {
         Ok(())
     }
 
-    pub(crate) fn validate_bindings(&self, canvas: bool) -> Result<(), String> {
+    pub(crate) fn validate_bindings(&self, compiler: &mut Compiler<'_>) -> Result<(), String> {
         for (name, value) in &self.constants {
             if matches!(value, Constant::Expression(_)) {
-                Expr::parse_located(name, &self.constants, canvas)
+                compiler
+                    .parse(name)
                     .map_err(|error| self.expression_error(name, error))?;
             }
         }
@@ -334,9 +337,11 @@ impl Config {
 
     pub(crate) fn from_settings(settings: Settings, canvas: bool) -> Result<Self, String> {
         settings.validate()?;
-        settings.validate_bindings(canvas)?;
-        let parse = |name, source: &str| {
-            Expr::parse_located(source, &settings.constants, canvas)
+        let mut compiler = Compiler::new(&settings.constants, canvas);
+        settings.validate_bindings(&mut compiler)?;
+        let mut parse = |name, source: &str| {
+            compiler
+                .parse(source)
                 .map_err(|error| settings.expression_error(name, error))
         };
         let background = parse("b", &settings.b)?;
@@ -375,25 +380,50 @@ impl Config {
         })
     }
 
+    pub fn cells(&self, t: i64, width: u16, height: u16) -> Result<Vec<Cell>, String> {
+        let count = usize::from(width) * usize::from(height);
+        let mut cells = Vec::with_capacity(count);
+        let mut evaluation = Evaluation::default();
+        for offset in 0..count {
+            cells.push(self.cell_cached(
+                Context {
+                    t: t.wrapping_add(offset as i64),
+                    ..Context::default()
+                },
+                &mut evaluation,
+            )?);
+        }
+        Ok(cells)
+    }
+
     pub fn cell_context(&self, context: Context) -> Result<Cell, String> {
+        self.cell_cached(context, &mut Evaluation::default())
+    }
+
+    pub(crate) fn cell_cached(
+        &self,
+        context: Context,
+        evaluation: &mut Evaluation,
+    ) -> Result<Cell, String> {
+        evaluation.begin();
         let t = context.t;
-        let eval = |name, expr: &Expr| {
-            expr.eval_context(context).map_err(|e| {
+        let eval = |name, expr: &Expr, evaluation: &mut Evaluation| {
+            expr.eval_cached(context, evaluation).map_err(|e| {
                 self.settings
                     .at_expression(name, 0, format!("{name} at t={t}: {e}"))
             })
         };
         Ok(Cell {
-            background: eval("b", &self.background)?.rem_euclid(256) as u8,
-            foreground: eval("f", &self.foreground)?.rem_euclid(256) as u8,
+            background: eval("b", &self.background, evaluation)?.rem_euclid(256) as u8,
+            foreground: eval("f", &self.foreground, evaluation)?.rem_euclid(256) as u8,
             character: if self.character.is_text() {
-                let character =
-                    self.character
-                        .eval_character_context(context)
-                        .map_err(|error| {
-                            self.settings
-                                .at_expression("c", 0, format!("c at t={t}: {error}"))
-                        })?;
+                let character = self
+                    .character
+                    .eval_character_cached(context, evaluation)
+                    .map_err(|error| {
+                        self.settings
+                            .at_expression("c", 0, format!("c at t={t}: {error}"))
+                    })?;
                 if character.is_control() || character.width() != Some(1) {
                     return Err(self.settings.at_expression("c", 0, format!(
                         "c at t={t}: direct character must be printable and occupy one terminal column"
@@ -401,7 +431,7 @@ impl Config {
                 }
                 character
             } else {
-                glyph(eval("c", &self.character)?)
+                glyph(eval("c", &self.character, evaluation)?)
             },
         })
     }
@@ -473,6 +503,18 @@ impl LiveConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_cells_share_bindings_without_reusing_values_between_samples() {
+        let config = Config::parse("a=t+1; z=t+10; b='a'; f='z'; c='a+z'").unwrap();
+        let cells = config.cells(3, 4, 1).unwrap();
+        for (offset, cell) in cells.iter().enumerate() {
+            let t = 3 + offset as i64;
+            assert_eq!(cell.background, (t + 1) as u8);
+            assert_eq!(cell.foreground, (t + 10) as u8);
+            assert_eq!(cell.character, glyph(2 * t + 11));
+        }
+    }
 
     #[test]
     fn diagnostics_locate_assignments_and_decoded_expressions_in_the_original_patch() {

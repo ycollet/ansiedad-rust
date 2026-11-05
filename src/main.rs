@@ -181,9 +181,7 @@ impl Drop for Terminal {
 }
 
 fn cells(config: &config::Config, t: i64, width: u16, height: u16) -> Result<Vec<Cell>, String> {
-    (0..i64::from(width) * i64::from(height))
-        .map(|offset| config.cell(t.wrapping_add(offset)))
-        .collect()
+    config.cells(t, width, height)
 }
 
 fn draw(
@@ -193,8 +191,9 @@ fn draw(
     height: u16,
     visual_height: u16,
     scroll: bool,
+    previous: Option<&[Cell]>,
 ) -> io::Result<()> {
-    let mut colors = None;
+    let mut colors: Option<(u8, u8)> = None;
     let scroll = scroll && visual_height > 1;
     if scroll {
         // DECSTBM keeps scrolling strictly inside the visual pane.
@@ -210,20 +209,26 @@ fn draw(
                 Clear(ClearType::CurrentLine)
             )?;
             colors = None;
-        } else {
-            queue!(out, MoveTo(0, y))?;
         }
+        let mut positioned = scroll;
         for x in 0..width {
-            let cell = frame[usize::from(y) * usize::from(width) + usize::from(x)];
-            let next_colors = (cell.background, cell.foreground);
-            if colors != Some(next_colors) {
-                queue!(
-                    out,
-                    SetBackgroundColor(Color::AnsiValue(cell.background)),
-                    SetForegroundColor(Color::AnsiValue(cell.foreground))
-                )?;
-                colors = Some(next_colors);
+            let index = usize::from(y) * usize::from(width) + usize::from(x);
+            let cell = frame[index];
+            if !scroll && previous.is_some_and(|previous| previous.get(index) == Some(&cell)) {
+                positioned = false;
+                continue;
             }
+            if !positioned {
+                queue!(out, MoveTo(x, y))?;
+                positioned = true;
+            }
+            if colors.is_none_or(|(background, _)| background != cell.background) {
+                queue!(out, SetBackgroundColor(Color::AnsiValue(cell.background)))?;
+            }
+            if colors.is_none_or(|(_, foreground)| foreground != cell.foreground) {
+                queue!(out, SetForegroundColor(Color::AnsiValue(cell.foreground)))?;
+            }
+            colors = Some((cell.background, cell.foreground));
             queue!(out, Print(cell.character))?;
         }
     }
@@ -329,6 +334,10 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
     let mut t = 0_i64;
     let mut paused = false;
     let mut dirty = true;
+    let mut ui_dirty = true;
+    let mut screen_size = None;
+    let mut previous_frame = Vec::new();
+    let mut previous_layout = None;
     let mut rendered = 0_u64;
     let mut runtime_error = None;
     let mut next_frame = Instant::now();
@@ -336,6 +345,7 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
     loop {
         let now = Instant::now();
         if now >= next_reload {
+            let previous_error = live.error.clone();
             if !editor.modified()
                 && let Some(path) = &args.path
                 && live.reload(path)
@@ -344,10 +354,17 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                 dirty = true;
                 runtime_error = None;
                 next_frame = now;
+                ui_dirty = true;
             }
+            ui_dirty |= previous_error != live.error;
             next_reload = now + Duration::from_millis(250);
         }
         let (screen_width, screen_height) = terminal::size()?;
+        if screen_size != Some((screen_width, screen_height)) {
+            screen_size = Some((screen_width, screen_height));
+            dirty = true;
+            ui_dirty = true;
+        }
         let layout = Layout::new(screen_height);
         let (width, height) = if args.maximize {
             (screen_width, layout.visual_height)
@@ -357,12 +374,16 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                 live.config.settings.l.min(layout.visual_height),
             )
         };
-        if (!paused && now >= next_frame || dirty) && width > 0 && height > 0 {
+        let rendered_this_loop = (!paused && now >= next_frame || dirty) && width > 0 && height > 0;
+        if rendered_this_loop {
             match cells(&live.config, t, width, height) {
                 Ok(frame) => {
                     if dirty {
                         queue!(out, ResetColor, Clear(ClearType::All))?;
+                        ui_dirty = true;
                     }
+                    let frame_layout =
+                        (width, height, layout.visual_height, live.config.settings.m);
                     draw(
                         &mut out,
                         &frame,
@@ -370,7 +391,11 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                         height,
                         layout.visual_height,
                         live.config.settings.m == 1,
+                        (!dirty && previous_layout == Some(frame_layout))
+                            .then_some(previous_frame.as_slice()),
                     )?;
+                    previous_frame = frame;
+                    previous_layout = Some(frame_layout);
                     runtime_error = None;
                 }
                 Err(e) => runtime_error = Some(e),
@@ -407,15 +432,17 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                 if paused { "PAUSED" } else { "LIVE" },
             )
         };
-        queue!(
-            out,
-            Hide,
-            ResetColor,
-            MoveTo(0, layout.status_y),
-            Clear(ClearType::CurrentLine),
-            Print(editor::window(&message, 0, usize::from(screen_width)))
-        )?;
-        if layout.visual_height > 0 {
+        if ui_dirty || rendered_this_loop {
+            queue!(
+                out,
+                Hide,
+                ResetColor,
+                MoveTo(0, layout.status_y),
+                Clear(ClearType::CurrentLine),
+                Print(editor::window(&message, 0, usize::from(screen_width)))
+            )?;
+        }
+        if ui_dirty && layout.visual_height > 0 {
             let (line, col) = editor.position();
             let title = format!(
                 "EDITOR{}{} [{}] {line}:{col} | Tab focus | Ctrl-S save | F5 reload",
@@ -437,14 +464,21 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                 ResetColor
             )?;
         }
-        editor.draw(
-            &mut out,
-            layout.editor_y,
-            layout.editor_height,
-            screen_width,
-            editing,
-        )?;
-        out.flush()?;
+        if ui_dirty {
+            editor.draw(
+                &mut out,
+                layout.editor_y,
+                layout.editor_height,
+                screen_width,
+                editing,
+            )?;
+        } else if rendered_this_loop && editing && layout.editor_height > 0 && screen_width > 0 {
+            editor.draw_cursor(&mut out, layout.editor_y, screen_width)?;
+        }
+        if ui_dirty || rendered_this_loop {
+            out.flush()?;
+        }
+        ui_dirty = false;
         if args.frames.is_some_and(|limit| rendered >= limit) {
             if let Some(error) = runtime_error {
                 return Err(error.into());
@@ -459,6 +493,7 @@ fn run(mut args: Args, mut live: LiveConfig) -> Result<(), Box<dyn Error>> {
                 .min(Duration::from_millis(50))
         };
         if event::poll(wait)? {
+            ui_dirty = true;
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -630,6 +665,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn redraw_skips_unchanged_cells_but_keeps_scroll_playback() {
+        let old = vec![
+            Cell {
+                background: 0,
+                foreground: 7,
+                character: 'a'
+            };
+            3
+        ];
+        let mut output = Vec::new();
+        draw(&mut output, &old, 3, 1, 10, false, Some(&old)).unwrap();
+        assert!(output.is_empty());
+        let mut changed = old.clone();
+        changed[1].character = 'b';
+        draw(&mut output, &changed, 3, 1, 10, false, Some(&old)).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.ends_with('b'));
+        assert!(!output.contains('a'));
+        let mut output = Vec::new();
+        draw(&mut output, &old, 3, 1, 10, true, Some(&old)).unwrap();
+        assert!(String::from_utf8(output).unwrap().contains("aaa"));
+        let mut output = Vec::new();
+        changed[1].background = 1;
+        draw(&mut output, &changed, 3, 1, 10, false, None).unwrap();
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("\x1b[38;5;7m")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn clipboard_shortcuts_do_not_quit_the_editor() {
         let control =
             |character| event::KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL);
@@ -677,7 +746,7 @@ mod tests {
         let config = config::Config::parse("c='144'").unwrap();
         let frame = cells(&config, 0, 2, 2).unwrap();
         let mut output = Vec::new();
-        draw(&mut output, &frame, 2, 2, 10, true).unwrap();
+        draw(&mut output, &frame, 2, 2, 10, true, None).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.starts_with("\x1b[1;10r"));
         assert!(text.ends_with("\x1b[r"));
@@ -685,7 +754,7 @@ mod tests {
         assert_eq!(text.matches("\x1b[1S").count(), 2);
         assert_eq!(text.matches('░').count(), 4);
         let mut output = Vec::new();
-        draw(&mut output, &frame[..2], 2, 1, 1, true).unwrap();
+        draw(&mut output, &frame[..2], 2, 1, 1, true, None).unwrap();
         assert!(!String::from_utf8(output).unwrap().contains("\x1b[1S"));
     }
 

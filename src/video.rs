@@ -200,6 +200,7 @@ fn export_config(
     control: &Control,
 ) -> Result<Outcome, String> {
     let mut rasterizer = Rasterizer::default();
+    let mut pixels = Vec::new();
     let mut t = 0_i64;
     let mut encoder = None;
     for frame in 0..frames {
@@ -212,7 +213,8 @@ fn export_config(
             Some(encoder) => encoder,
             slot @ None => slot.insert(Encoder::new(path.clone(), size, fps)?),
         };
-        encoder.write(&rasterizer.render(&image)?)?;
+        rasterizer.render_into(&image, &mut pixels)?;
+        encoder.write(&pixels)?;
         control.frames.fetch_add(1, Ordering::Relaxed);
         t = t.wrapping_add(i64::from(config.settings().w) * i64::from(config.settings().l));
     }
@@ -233,6 +235,7 @@ fn record_frames(
     control: &Control,
 ) -> Result<Outcome, String> {
     let mut rasterizer = Rasterizer::default();
+    let mut pixels = Vec::new();
     let mut encoder = Encoder::new(path, size, fps)?;
     loop {
         if control.canceled.load(Ordering::Relaxed) {
@@ -240,7 +243,7 @@ fn record_frames(
         }
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(capture) => {
-                let pixels = rasterizer.render(&capture.image)?;
+                rasterizer.render_into(&capture.image, &mut pixels)?;
                 for _ in 0..capture.repeat {
                     if control.canceled.load(Ordering::Relaxed) {
                         return Ok(Outcome::Canceled);
@@ -274,6 +277,7 @@ fn dimensions(image: &CanvasFrame) -> [usize; 2] {
 struct Rasterizer {
     fonts: Vec<Font>,
     glyphs: HashMap<char, [u8; 128]>,
+    tiles: HashMap<(char, u8, u8), [u8; 384]>,
 }
 
 impl Rasterizer {
@@ -320,44 +324,84 @@ impl Rasterizer {
         }))
     }
 
+    fn tile(
+        &mut self,
+        character: char,
+        background: u8,
+        foreground: u8,
+    ) -> Result<&[u8; 384], String> {
+        let key = (character, background, foreground);
+        if !self.tiles.contains_key(&key) {
+            let background = ansi_color(background);
+            let foreground = ansi_color(foreground);
+            let glyph = self.glyph(character)?;
+            let mut tile = [0; 384];
+            for (pixel, &alpha) in tile.as_chunks_mut::<3>().0.iter_mut().zip(glyph) {
+                let alpha = u16::from(alpha);
+                for channel in 0..3 {
+                    pixel[channel] = ((u16::from(foreground[channel]) * alpha
+                        + u16::from(background[channel]) * (255 - alpha)
+                        + 127)
+                        / 255) as u8;
+                }
+            }
+            // Bound cache memory independently of the number of colors in a long recording.
+            if self.tiles.len() >= 4096 {
+                self.tiles.clear();
+            }
+            self.tiles.insert(key, tile);
+        }
+        Ok(&self.tiles[&key])
+    }
+
+    #[cfg(test)]
     fn render(&mut self, image: &CanvasFrame) -> Result<Vec<u8>, String> {
+        let mut output = Vec::new();
+        self.render_into(image, &mut output)?;
+        Ok(output)
+    }
+
+    fn render_into(&mut self, image: &CanvasFrame, output: &mut Vec<u8>) -> Result<(), String> {
         let [width, height] = dimensions(image);
         let stride = width.next_multiple_of(2);
-        let mut output = vec![0; stride * height.next_multiple_of(2) * 3];
+        output.resize(stride * height.next_multiple_of(2) * 3, 0);
+        if width != stride {
+            for row in output[..height * stride * 3].chunks_exact_mut(stride * 3) {
+                row[width * 3..].fill(0);
+            }
+        }
+        output[height * stride * 3..].fill(0);
         match image {
             CanvasFrame::Pixels { size, pixels } => {
-                for (index, &[r, g, b, alpha]) in pixels.iter().enumerate() {
-                    let offset = ((index / size[0]) * stride + index % size[0]) * 3;
-                    for (channel, value) in [r, g, b].into_iter().enumerate() {
-                        output[offset + channel] =
-                            ((u16::from(value) * u16::from(alpha) + 127) / 255) as u8;
+                for (source, row) in pixels
+                    .chunks_exact(size[0])
+                    .zip(output.chunks_exact_mut(stride * 3))
+                {
+                    for (&[r, g, b, alpha], pixel) in
+                        source.iter().zip(row[..width * 3].as_chunks_mut::<3>().0)
+                    {
+                        *pixel = match alpha {
+                            0 => [0; 3],
+                            255 => [r, g, b],
+                            _ => [r, g, b].map(|value| {
+                                ((u16::from(value) * u16::from(alpha) + 127) / 255) as u8
+                            }),
+                        };
                     }
                 }
             }
             CanvasFrame::Characters { size, cells } => {
                 for (index, cell) in cells.iter().enumerate() {
-                    let background = ansi_color(cell.background);
-                    let foreground = ansi_color(cell.foreground);
-                    let glyph = self.glyph(cell.character)?;
+                    let tile = self.tile(cell.character, cell.background, cell.foreground)?;
+                    let start = ((index / size[0]) * 16 * stride + (index % size[0]) * 8) * 3;
                     for y in 0..16 {
-                        for x in 0..8 {
-                            let offset =
-                                (((index / size[0]) * 16 + y) * stride + (index % size[0]) * 8 + x)
-                                    * 3;
-                            let alpha = u16::from(glyph[y * 8 + x]);
-                            for channel in 0..3 {
-                                output[offset + channel] =
-                                    ((u16::from(foreground[channel]) * alpha
-                                        + u16::from(background[channel]) * (255 - alpha)
-                                        + 127)
-                                        / 255) as u8;
-                            }
-                        }
+                        let offset = start + y * stride * 3;
+                        output[offset..offset + 24].copy_from_slice(&tile[y * 24..y * 24 + 24]);
                     }
                 }
             }
         }
-        Ok(output)
+        Ok(())
     }
 }
 
@@ -524,6 +568,28 @@ impl Drop for Encoder {
 mod tests {
     use super::*;
     use crate::config::Cell;
+
+    #[test]
+    fn reused_raster_buffers_clear_padding_and_tiles_include_both_colors() {
+        let mut rasterizer = Rasterizer::default();
+        let mut output = vec![255; 24];
+        let image = CanvasFrame::Pixels {
+            size: [3, 1],
+            pixels: vec![[20, 40, 60, 255]; 3],
+        };
+        rasterizer.render_into(&image, &mut output).unwrap();
+        assert_eq!(&output[..9], &[20, 40, 60, 20, 40, 60, 20, 40, 60]);
+        assert!(output[9..].iter().all(|value| *value == 0));
+        let first = *rasterizer.tile('E', 1, 15).unwrap();
+        assert_ne!(first, *rasterizer.tile('E', 2, 15).unwrap());
+        assert_ne!(first, *rasterizer.tile('E', 1, 3).unwrap());
+        for colors in 0..4200 {
+            rasterizer
+                .tile('E', (colors / 256) as u8, colors as u8)
+                .unwrap();
+        }
+        assert_eq!(first, *rasterizer.tile('E', 1, 15).unwrap());
+    }
 
     #[test]
     fn rasterization_composites_alpha_and_pads_odd_dimensions() {

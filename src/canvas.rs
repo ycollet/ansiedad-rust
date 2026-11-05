@@ -1,6 +1,6 @@
 use crate::{
     config::{Cell, Config, Settings},
-    expr::{Constant, Context, Expr},
+    expr::{Compiler, Constant, Context, Evaluation, Expr},
 };
 
 pub const STARTER: &str = "\
@@ -76,8 +76,10 @@ impl CanvasConfig {
         let renderer = match mode {
             Mode::Characters => Renderer::Characters(Config::from_settings(settings, true)?),
             Mode::Pixels => {
-                settings.validate_bindings(true)?;
-                let rgba = Expr::parse_located(&rgba, &settings.constants, true)
+                let mut compiler = Compiler::new(&settings.constants, true);
+                settings.validate_bindings(&mut compiler)?;
+                let rgba = compiler
+                    .parse(&rgba)
                     .map_err(|error| settings.expression_error("rgba", error))?;
                 if rgba.is_text() {
                     return Err(settings.at_expression(
@@ -121,23 +123,28 @@ impl CanvasConfig {
                 context.x, context.y
             )
         };
+        let count = size[0] * size[1];
+        let mut evaluation = Evaluation::default();
         match &self.renderer {
             Renderer::Characters(config) => {
-                let cells = (0..size[0] * size[1])
-                    .map(|offset| {
-                        let context = context(offset);
+                let mut cells = Vec::with_capacity(count);
+                for offset in 0..count {
+                    let context = context(offset);
+                    cells.push(
                         config
-                            .cell_context(context)
-                            .map_err(|message| error(context, message))
-                    })
-                    .collect::<Result<_, _>>()?;
+                            .cell_cached(context, &mut evaluation)
+                            .map_err(|message| error(context, message))?,
+                    );
+                }
                 Ok(CanvasFrame::Characters { size, cells })
             }
             Renderer::Pixels { rgba, .. } => {
-                let pixels = (0..size[0] * size[1])
-                    .map(|offset| {
-                        let context = context(offset);
-                        rgba.eval_context(context)
+                let mut pixels = Vec::with_capacity(count);
+                for offset in 0..count {
+                    let context = context(offset);
+                    evaluation.begin();
+                    pixels.push(
+                        rgba.eval_cached(context, &mut evaluation)
                             .map(|value| (value as u32).to_be_bytes())
                             .map_err(|message| {
                                 error(
@@ -148,9 +155,9 @@ impl CanvasConfig {
                                         format!("rgba at t={}: {message}", context.t),
                                     ),
                                 )
-                            })
-                    })
-                    .collect::<Result<_, _>>()?;
+                            })?,
+                    );
+                }
                 Ok(CanvasFrame::Pixels { size, pixels })
             }
         }
