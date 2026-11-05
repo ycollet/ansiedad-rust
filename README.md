@@ -5,6 +5,10 @@ a live-coding visual instrument inspired by bytebeat and IBNIZ. No GUI or audio
 device is needed: the output is a grid of CP437-style Unicode characters with
 256-color ANSI foregrounds and backgrounds.
 
+## Screenshot
+
+![screenshot](ansiedad.png)
+
 ## Run
 
 Install a current stable Rust toolchain, then:
