@@ -32,6 +32,7 @@ Source: "..\target\x86_64-pc-windows-msvc\release\ansiedad.exe"; DestDir: "{app}
 Source: "..\target\x86_64-pc-windows-msvc\release\ansiedad-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\DOCUMENTATION.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\examples\*.txt"; DestDir: "{app}\examples"; Flags: ignoreversion
 
 [Icons]

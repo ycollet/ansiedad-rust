@@ -19,6 +19,7 @@ install -Dm644 packaging/ansiedad-gui.desktop "$root/usr/share/applications/ansi
 install -Dm644 assets/ansiedad.svg "$root/usr/share/icons/hicolor/scalable/apps/ansiedad.svg"
 install -Dm644 assets/ansiedad.png "$root/usr/share/icons/hicolor/256x256/apps/ansiedad.png"
 install -Dm644 README.md "$root/usr/share/doc/ansiedad/README.md"
+install -Dm644 DOCUMENTATION.md "$root/usr/share/doc/ansiedad/DOCUMENTATION.md"
 for example in examples/*.txt; do
   install -Dm644 "$example" "$root/usr/share/doc/ansiedad/$example"
 done

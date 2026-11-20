@@ -9,7 +9,7 @@ interactive rendering and clipboard access still need manual testing.
 ## Release installers
 
 The [Release installers workflow](workflows/release.yml) builds both `ansiedad`
-and `ansiedad-gui`, includes the license, README, and example patches, and verifies
+and `ansiedad-gui`, includes the license, README, documentation, and example patches, and verifies
 the installed applications using their display-independent `--check` commands.
 
 | Platform | Installer | Architecture |

@@ -9,7 +9,7 @@ mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 for binary in ansiedad ansiedad-gui; do
   cp "target/$TARGET/release/$binary" "$app/Contents/MacOS/$binary"
 done
-cp LICENSE README.md "$app/Contents/Resources/"
+cp LICENSE README.md DOCUMENTATION.md "$app/Contents/Resources/"
 cp assets/ansiedad.icns "$app/Contents/Resources/"
 cp -R examples "$app/Contents/Resources/"
 cat > "$app/Contents/Info.plist" <<EOF
